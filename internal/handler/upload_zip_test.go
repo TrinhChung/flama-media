@@ -11,17 +11,32 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/TrinhChung/flama-media/internal/auth"
 	"github.com/TrinhChung/flama-media/internal/config"
+	"github.com/TrinhChung/flama-media/internal/reporter"
 	"github.com/TrinhChung/flama-media/internal/storage"
 )
 
+type mockReporter struct {
+	mu        sync.Mutex
+	incidents []reporter.SecurityIncident
+}
+
+func (m *mockReporter) ReportIncidentAsync(incident reporter.SecurityIncident) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.incidents = append(m.incidents, incident)
+}
+
+func (m *mockReporter) Close() {}
+
 func createValidToken(secret string) string {
 	ticket := auth.UploadTicket{
-		UserID:   1,
+		UserID:   42,
 		MaxBytes: 10485760,
 		Exp:      time.Now().Unix() + 300,
 	}
@@ -44,7 +59,8 @@ func TestUploadZipHandler_ZipSlipProtection(t *testing.T) {
 		MaxUploadBytes: 10 * 1024 * 1024,
 	}
 	store, _ := storage.NewDiskStorage(tempDir)
-	h := NewUploadZipHandler(cfg, store)
+	rep := &mockReporter{}
+	h := NewUploadZipHandler(cfg, store, rep)
 
 	// Create a zip with a malicious traversal path
 	var zipBuf bytes.Buffer
@@ -72,5 +88,18 @@ func TestUploadZipHandler_ZipSlipProtection(t *testing.T) {
 	}
 	if resp.AcceptedCount != 0 {
 		t.Errorf("expected 0 accepted files, got %d", resp.AcceptedCount)
+	}
+
+	// Verify incident was reported with user_id 42 and type ZIP_SLIP
+	rep.mu.Lock()
+	defer rep.mu.Unlock()
+	if len(rep.incidents) != 1 {
+		t.Fatalf("expected 1 reported incident, got %d", len(rep.incidents))
+	}
+	if rep.incidents[0].IncidentType != "ZIP_SLIP" {
+		t.Errorf("expected incident type ZIP_SLIP, got %s", rep.incidents[0].IncidentType)
+	}
+	if rep.incidents[0].UserID != 42 {
+		t.Errorf("expected incident user_id 42, got %d", rep.incidents[0].UserID)
 	}
 }

@@ -5,20 +5,23 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/TrinhChung/flama-media/internal/auth"
 	"github.com/TrinhChung/flama-media/internal/config"
+	"github.com/TrinhChung/flama-media/internal/reporter"
 	"github.com/TrinhChung/flama-media/internal/sanitizer"
 	"github.com/TrinhChung/flama-media/internal/storage"
 )
 
 type UploadHandler struct {
-	cfg     *config.Config
-	storage *storage.DiskStorage
+	cfg      *config.Config
+	storage  *storage.DiskStorage
+	reporter reporter.Reporter
 }
 
-func NewUploadHandler(cfg *config.Config, s *storage.DiskStorage) *UploadHandler {
-	return &UploadHandler{cfg: cfg, storage: s}
+func NewUploadHandler(cfg *config.Config, s *storage.DiskStorage, rep reporter.Reporter) *UploadHandler {
+	return &UploadHandler{cfg: cfg, storage: s, reporter: rep}
 }
 
 type UploadResponse struct {
@@ -36,6 +39,8 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientIP := extractClientIP(r)
+
 	// 1. Verify Authorization Header (HMAC Ticket)
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
@@ -49,6 +54,14 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, auth.ErrTokenExpired) {
 			writeJSONError(w, http.StatusForbidden, "TOKEN_EXPIRED", "Upload ticket has expired")
 			return
+		}
+		if errors.Is(err, auth.ErrInvalidSignature) && h.reporter != nil {
+			h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+				IncidentType: "FORGED_TOKEN",
+				Detail:       "Signature check failed on upload token",
+				ClientIP:     clientIP,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			})
 		}
 		writeJSONError(w, http.StatusForbidden, "INVALID_TOKEN", "Cryptographic signature check failed")
 		return
@@ -89,6 +102,23 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.cfg.MaxImagePixels,
 	)
 	if err != nil {
+		if errors.Is(err, sanitizer.ErrDecompressionBomb) && h.reporter != nil {
+			h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+				UserID:       ticket.UserID,
+				IncidentType: "DECOMPRESSION_BOMB",
+				Detail:       err.Error(),
+				ClientIP:     clientIP,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			})
+		} else if errors.Is(err, sanitizer.ErrDisallowedSVG) && h.reporter != nil {
+			h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+				UserID:       ticket.UserID,
+				IncidentType: "SVG_EXPLOIT",
+				Detail:       "SVG payload detected, blocked",
+				ClientIP:     clientIP,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			})
+		}
 		writeJSONError(w, http.StatusBadRequest, "SANITIZATION_FAILED", err.Error())
 		return
 	}
@@ -113,6 +143,24 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func extractClientIP(r *http.Request) string {
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			ip := strings.TrimSpace(parts[0])
+			if ip != "" {
+				return ip
+			}
+		}
+	}
+	ip := r.RemoteAddr
+	if colonIdx := strings.LastIndex(ip, ":"); colonIdx != -1 {
+		ip = ip[:colonIdx]
+	}
+	return ip
 }
 
 func writeJSONError(w http.ResponseWriter, status int, code, message string) {

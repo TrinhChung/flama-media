@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/TrinhChung/flama-media/internal/auth"
 	"github.com/TrinhChung/flama-media/internal/config"
+	"github.com/TrinhChung/flama-media/internal/reporter"
 	"github.com/TrinhChung/flama-media/internal/sanitizer"
 	"github.com/TrinhChung/flama-media/internal/storage"
 )
@@ -24,12 +26,13 @@ const (
 )
 
 type UploadZipHandler struct {
-	cfg     *config.Config
-	storage *storage.DiskStorage
+	cfg      *config.Config
+	storage  *storage.DiskStorage
+	reporter reporter.Reporter
 }
 
-func NewUploadZipHandler(cfg *config.Config, s *storage.DiskStorage) *UploadZipHandler {
-	return &UploadZipHandler{cfg: cfg, storage: s}
+func NewUploadZipHandler(cfg *config.Config, s *storage.DiskStorage, rep reporter.Reporter) *UploadZipHandler {
+	return &UploadZipHandler{cfg: cfg, storage: s, reporter: rep}
 }
 
 type ZipItemResult struct {
@@ -56,6 +59,8 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientIP := extractClientIP(r)
+
 	// 1. Verify Authorization Header (HMAC Ticket)
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
@@ -69,6 +74,14 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, auth.ErrTokenExpired) {
 			writeJSONError(w, http.StatusForbidden, "TOKEN_EXPIRED", "Upload ticket has expired")
 			return
+		}
+		if errors.Is(err, auth.ErrInvalidSignature) && h.reporter != nil {
+			h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+				IncidentType: "FORGED_TOKEN",
+				Detail:       "Signature check failed on zip upload token",
+				ClientIP:     clientIP,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			})
 		}
 		writeJSONError(w, http.StatusForbidden, "INVALID_TOKEN", "Cryptographic signature check failed")
 		return
@@ -163,6 +176,15 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Error:            "unsafe filename path (traversal attempt)",
 			})
 			rejectedCount++
+			if h.reporter != nil {
+				h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+					UserID:       ticket.UserID,
+					IncidentType: "ZIP_SLIP",
+					Detail:       fmt.Sprintf("Zip-Slip path traversal attempt: %s", f.Name),
+					ClientIP:     clientIP,
+					Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				})
+			}
 			continue
 		}
 
@@ -170,6 +192,15 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.CompressedSize64 > 0 {
 			ratio := f.UncompressedSize64 / f.CompressedSize64
 			if ratio > DefaultMaxCompressionRatio {
+				if h.reporter != nil {
+					h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+						UserID:       ticket.UserID,
+						IncidentType: "ZIP_BOMB",
+						Detail:       fmt.Sprintf("Suspicious compression ratio on file %s (%d:1)", f.Name, ratio),
+						ClientIP:     clientIP,
+						Timestamp:    time.Now().UTC().Format(time.RFC3339),
+					})
+				}
 				writeJSONError(w, http.StatusBadRequest, "ZIP_BOMB_DETECTED",
 					fmt.Sprintf("Suspicious compression ratio on file %s (possible zip bomb)", f.Name))
 				return
@@ -179,6 +210,15 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Zip Bomb Check 2: Total uncompressed size limit
 		totalUncompressed += int64(f.UncompressedSize64)
 		if totalUncompressed > DefaultMaxZipUncompressedSize {
+			if h.reporter != nil {
+				h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+					UserID:       ticket.UserID,
+					IncidentType: "ZIP_BOMB",
+					Detail:       "Total uncompressed content exceeds 100MB limit (possible zip bomb)",
+					ClientIP:     clientIP,
+					Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				})
+			}
 			writeJSONError(w, http.StatusBadRequest, "ZIP_BOMB_DETECTED",
 				"Total uncompressed content exceeds 100MB limit (possible zip bomb)")
 			return
@@ -201,6 +241,23 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = rc.Close()
 
 		if err != nil {
+			if errors.Is(err, sanitizer.ErrDecompressionBomb) && h.reporter != nil {
+				h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+					UserID:       ticket.UserID,
+					IncidentType: "DECOMPRESSION_BOMB",
+					Detail:       fmt.Sprintf("File %s in zip: %v", f.Name, err),
+					ClientIP:     clientIP,
+					Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				})
+			} else if errors.Is(err, sanitizer.ErrDisallowedSVG) && h.reporter != nil {
+				h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
+					UserID:       ticket.UserID,
+					IncidentType: "SVG_EXPLOIT",
+					Detail:       fmt.Sprintf("SVG file %s detected in zip", f.Name),
+					ClientIP:     clientIP,
+					Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				})
+			}
 			results = append(results, ZipItemResult{
 				OriginalFilename: f.Name,
 				Error:            err.Error(),

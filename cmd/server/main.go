@@ -12,6 +12,7 @@ import (
 
 	"github.com/TrinhChung/flama-media/internal/config"
 	"github.com/TrinhChung/flama-media/internal/handler"
+	"github.com/TrinhChung/flama-media/internal/reporter"
 	"github.com/TrinhChung/flama-media/internal/storage"
 )
 
@@ -25,9 +26,13 @@ func main() {
 		log.Fatalf("[FATAL] Failed to initialize storage: %v", err)
 	}
 
+	// Initialize security incident reporter to Chung VPS
+	incidentReporter := reporter.NewHTTPReporter(cfg.SecurityCallbackURL, cfg.InternalSecret)
+	defer incidentReporter.Close()
+
 	// Handlers
-	uploadHandler := handler.NewUploadHandler(cfg, store)
-	uploadZipHandler := handler.NewUploadZipHandler(cfg, store)
+	uploadHandler := handler.NewUploadHandler(cfg, store, incidentReporter)
+	uploadZipHandler := handler.NewUploadZipHandler(cfg, store, incidentReporter)
 	serveHandler := handler.NewServeHandler(cfg, store)
 
 	mux := http.NewServeMux()
@@ -65,6 +70,7 @@ func main() {
 	go func() {
 		log.Printf("[INFO] Flama Media Service running on port %s", cfg.Port)
 		log.Printf("[INFO] Storage root: %s", cfg.StorageRoot)
+		log.Printf("[INFO] Security callback URL: %s", cfg.SecurityCallbackURL)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[FATAL] ListenAndServe failed: %v", err)
 		}

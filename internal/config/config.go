@@ -8,16 +8,18 @@ import (
 )
 
 type Config struct {
-	Port              string
-	SharedSecret      string
-	GatewaySecret     string // Header X-Flama-Gateway-Secret for OV to 212 verification
-	StorageRoot       string
-	TempRoot          string
-	MaxUploadBytes    int64
-	MaxImageDimension int
-	MaxImagePixels    int
-	AllowedOrigins    string
-	TrustedProxies    []string
+	Port                string
+	SharedSecret        string
+	GatewaySecret       string // Header X-Flama-Gateway-Secret for OV to 212 verification
+	InternalSecret      string // Header X-Internal-Secret sent when reporting incidents to Chung VPS
+	SecurityCallbackURL string // Webhook URL on Chung VPS to report attacks
+	StorageRoot         string
+	TempRoot            string
+	MaxUploadBytes      int64
+	MaxImageDimension   int
+	MaxImagePixels      int
+	AllowedOrigins      string
+	TrustedProxies      []string
 }
 
 func Load() *Config {
@@ -27,6 +29,10 @@ func Load() *Config {
 		log.Println("[WARN] MEDIA_SHARED_SECRET is not set! Using default insecure development secret.")
 		secret = "flama-dev-insecure-media-secret-change-in-production-123456789"
 	}
+
+	gatewaySecret := getEnv("GATEWAY_SECRET", "")
+	internalSecret := getEnv("INTERNAL_SECURITY_SECRET", gatewaySecret)
+	securityCallbackURL := getEnv("SECURITY_CALLBACK_URL", "http://10.10.0.4:4789/api/v1/internal/security/incident")
 
 	trustedProxiesStr := getEnv("TRUSTED_PROXIES", "")
 	var trustedProxies []string
@@ -39,16 +45,18 @@ func Load() *Config {
 	}
 
 	return &Config{
-		Port:              port,
-		SharedSecret:      secret,
-		GatewaySecret:     getEnv("GATEWAY_SECRET", ""), // Optional extra security token between OV and 212
-		StorageRoot:       getEnv("MEDIA_STORAGE_ROOT", "./data/media"),
-		TempRoot:          getEnv("MEDIA_TEMP_ROOT", "./data/tmp"),
-		MaxUploadBytes:    getInt64Env("MAX_UPLOAD_BYTES", 20*1024*1024), // 20MB
-		MaxImageDimension: getIntEnv("MAX_IMAGE_DIMENSION", 4096),
-		MaxImagePixels:    getIntEnv("MAX_IMAGE_PIXELS", 16000000), // 16 MegaPixels
-		AllowedOrigins:    getEnv("ALLOWED_ORIGINS", "*"),
-		TrustedProxies:    trustedProxies,
+		Port:                port,
+		SharedSecret:        secret,
+		GatewaySecret:       gatewaySecret,
+		InternalSecret:      internalSecret,
+		SecurityCallbackURL: securityCallbackURL,
+		StorageRoot:         getEnv("MEDIA_STORAGE_ROOT", "./data/media"),
+		TempRoot:            getEnv("MEDIA_TEMP_ROOT", "./data/tmp"),
+		MaxUploadBytes:      getInt64Env("MAX_UPLOAD_BYTES", 20*1024*1024), // 20MB
+		MaxImageDimension:   getIntEnv("MAX_IMAGE_DIMENSION", 4096),
+		MaxImagePixels:      getIntEnv("MAX_IMAGE_PIXELS", 16000000), // 16 MegaPixels
+		AllowedOrigins:      getEnv("ALLOWED_ORIGINS", "*"),
+		TrustedProxies:      trustedProxies,
 	}
 }
 
