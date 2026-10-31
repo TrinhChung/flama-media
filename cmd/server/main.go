@@ -27,6 +27,7 @@ func main() {
 
 	// Handlers
 	uploadHandler := handler.NewUploadHandler(cfg, store)
+	uploadZipHandler := handler.NewUploadZipHandler(cfg, store)
 	serveHandler := handler.NewServeHandler(cfg, store)
 
 	mux := http.NewServeMux()
@@ -34,9 +35,13 @@ func main() {
 	// Health check
 	mux.HandleFunc("GET /health", handler.HealthCheck)
 
-	// Upload routes (accepts both /media/upload and /upload)
+	// Single media upload routes
 	mux.Handle("POST /media/upload", uploadHandler)
 	mux.Handle("POST /upload", uploadHandler)
+
+	// Batch ZIP media upload routes (Anki packages, media zip packages)
+	mux.Handle("POST /media/upload-zip", uploadZipHandler)
+	mux.Handle("POST /upload-zip", uploadZipHandler)
 
 	// Media serve route (canonical Flama format)
 	mux.Handle("GET /media/proxy/", serveHandler)
