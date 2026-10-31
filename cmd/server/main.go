@@ -48,7 +48,11 @@ func main() {
 	mux.Handle("POST /media/upload-zip", uploadZipHandler)
 	mux.Handle("POST /upload-zip", uploadZipHandler)
 
-	// Media serve route (canonical Flama format)
+	// Media serve routes (Supports /store/, /media/store/, and legacy /media/proxy/)
+	mux.Handle("GET /store/", serveHandler)
+	mux.Handle("HEAD /store/", serveHandler)
+	mux.Handle("GET /media/store/", serveHandler)
+	mux.Handle("HEAD /media/store/", serveHandler)
 	mux.Handle("GET /media/proxy/", serveHandler)
 	mux.Handle("HEAD /media/proxy/", serveHandler)
 

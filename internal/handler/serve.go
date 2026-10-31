@@ -28,8 +28,14 @@ func (h *ServeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract asset ID from path: /media/proxy/<asset_id>
-	path := strings.TrimPrefix(r.URL.Path, "/media/proxy/")
+	// Extract asset ID from path: /store/<id>, /media/store/<id>, or /media/proxy/<id>
+	path := r.URL.Path
+	for _, prefix := range []string{"/media/store/", "/store/", "/media/proxy/"} {
+		if strings.HasPrefix(path, prefix) {
+			path = strings.TrimPrefix(path, prefix)
+			break
+		}
+	}
 	assetID := strings.Trim(path, "/")
 
 	if assetID == "" || strings.Contains(assetID, "/") || strings.Contains(assetID, "..") {
