@@ -1,0 +1,24 @@
+services:
+  flama-media:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flama-media
+    restart: unless-stopped
+    ports:
+      # Lắng nghe trên port 4792 (chỉ mở cho mạng nội bộ/OV)
+      - "4792:4792"
+    environment:
+      - PORT=4792
+      - MEDIA_SHARED_SECRET=${MEDIA_SHARED_SECRET}
+      - GATEWAY_SECRET=${GATEWAY_SECRET}
+      - MEDIA_STORAGE_ROOT=/data/flama/media
+      - MAX_UPLOAD_BYTES=20971520
+    volumes:
+      # Mount thư mục lưu trữ media trên Máy 212
+      - /data/flama/media:/data/flama/media
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:4792/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
