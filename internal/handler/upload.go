@@ -36,7 +36,7 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Verify Authorization Header (HMAC Ticket)
-	authHeader := r.Headers.Get("Authorization")
+	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
 		writeJSONError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Missing or invalid Bearer token")
 		return
