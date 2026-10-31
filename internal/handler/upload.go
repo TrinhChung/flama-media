@@ -22,11 +22,12 @@ func NewUploadHandler(cfg *config.Config, s *storage.DiskStorage) *UploadHandler
 }
 
 type UploadResponse struct {
-	AssetID     string `json:"asset_id"`
-	URL         string `json:"url"`
-	SHA256      string `json:"sha256"`
-	SizeBytes   int64  `json:"size_bytes"`
-	ContentType string `json:"content_type"`
+	AssetID      string `json:"asset_id"`
+	URL          string `json:"url"`
+	SHA256       string `json:"sha256"`
+	SizeBytes    int64  `json:"size_bytes"`
+	ContentType  string `json:"content_type"`
+	Deduplicated bool   `json:"deduplicated"`
 }
 
 func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -101,11 +102,12 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 6. Return response with canonical Flama proxy URL
 	resp := UploadResponse{
-		AssetID:     asset.ID,
-		URL:         "/media/proxy/" + asset.ID,
-		SHA256:      asset.SHA256,
-		SizeBytes:   asset.SizeBytes,
-		ContentType: asset.ContentType,
+		AssetID:      asset.ID,
+		URL:          "/media/proxy/" + asset.ID,
+		SHA256:       asset.SHA256,
+		SizeBytes:    asset.SizeBytes,
+		ContentType:  asset.ContentType,
+		Deduplicated: asset.Deduplicated,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

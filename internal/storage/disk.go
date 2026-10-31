@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -18,6 +17,7 @@ type SavedAsset struct {
 	ContentType  string `json:"content_type"`
 	Filename     string `json:"filename"`
 	RelativePath string `json:"relative_path"`
+	Deduplicated bool   `json:"deduplicated"`
 }
 
 type DiskStorage struct {
@@ -38,38 +38,68 @@ func NewDiskStorage(rootDir string) (*DiskStorage, error) {
 	return &DiskStorage{rootDir: absRoot}, nil
 }
 
-// Save writes sanitized media bytes to disk using a random UUIDv4 and 2-level hashed directory.
+// Save writes sanitized media bytes to disk using Content-Addressable Storage (CAS) based on SHA-256.
+// If the exact content already exists on disk, writing is skipped (Deduplication) to save disk space and I/O.
 func (s *DiskStorage) Save(data []byte, ext string, contentType string) (*SavedAsset, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 1. Generate UUIDv4
-	id, err := generateUUIDv4()
-	if err != nil {
-		return nil, fmt.Errorf("generate asset id: %w", err)
-	}
-
-	// 2. Compute SHA256
+	// 1. Compute SHA256 of sanitized payload
 	hash := sha256.Sum256(data)
 	hashHex := hex.EncodeToString(hash[:])
+	id := hashHex
 
-	// 3. Sharded directory structure: e.g. root/ab/cd/<uuid>.ext
+	// 2. Sharded directory structure based on SHA256: e.g. root/ab/cd/<sha256>.ext
 	prefix1 := id[0:2]
 	prefix2 := id[2:4]
 	filename := id + ext
 	dirPath := filepath.Join(s.rootDir, prefix1, prefix2)
+	fullPath := filepath.Join(dirPath, filename)
+	relPath := filepath.Join(prefix1, prefix2, filename)
 
+	// 3. Deduplication Check: if file already exists with same hash, return it directly without writing
+	if fi, err := os.Stat(fullPath); err == nil && !fi.IsDir() {
+		return &SavedAsset{
+			ID:           id,
+			SHA256:       hashHex,
+			SizeBytes:    fi.Size(),
+			ContentType:  contentType,
+			Filename:     filename,
+			RelativePath: relPath,
+			Deduplicated: true,
+		}, nil
+	}
+
+	// 4. Create directory if not exists
 	if err := os.MkdirAll(dirPath, 0750); err != nil {
 		return nil, fmt.Errorf("create shard directory: %w", err)
 	}
 
-	fullPath := filepath.Join(dirPath, filename)
-	// Write file with strict 0640 permissions
-	if err := os.WriteFile(fullPath, data, 0640); err != nil {
+	// 5. Write atomically via temp file to avoid partial writes during concurrent requests
+	tmpFile, err := os.CreateTemp(dirPath, ".upload-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp upload file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpName)
 		return nil, fmt.Errorf("write media file: %w", err)
 	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return nil, fmt.Errorf("close temp file: %w", err)
+	}
 
-	relPath := filepath.Join(prefix1, prefix2, filename)
+	// Set strict 0640 permissions
+	_ = os.Chmod(tmpName, 0640)
+
+	// Atomic rename to final CAS path
+	if err := os.Rename(tmpName, fullPath); err != nil {
+		_ = os.Remove(tmpName)
+		return nil, fmt.Errorf("atomic rename media file: %w", err)
+	}
 
 	return &SavedAsset{
 		ID:           id,
@@ -78,10 +108,11 @@ func (s *DiskStorage) Save(data []byte, ext string, contentType string) (*SavedA
 		ContentType:  contentType,
 		Filename:     filename,
 		RelativePath: relPath,
+		Deduplicated: false,
 	}, nil
 }
 
-// FindById locates an asset on disk by ID.
+// FindById locates an asset on disk by ID (either SHA-256 or legacy UUID).
 func (s *DiskStorage) FindById(id string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -113,16 +144,4 @@ func (s *DiskStorage) FindById(id string) (string, error) {
 	}
 
 	return "", os.ErrNotExist
-}
-
-func generateUUIDv4() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	// Set UUID version 4 and variant
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
