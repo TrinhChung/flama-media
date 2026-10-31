@@ -1,0 +1,99 @@
+name: CI/CD Flama Media to Worker 212
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: flama-media-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Run Tests
+        run: |
+          go vet ./...
+          go test -v -race ./...
+
+  build-and-deploy:
+    name: Build ARM64 Binary & Deploy
+    needs: test
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build Binary for Linux ARM64
+        run: |
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          VERSION="${{ github.ref_name }}"
+          COMMIT_SHA="${{ github.sha }}"
+          
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w \
+            -X 'github.com/TrinhChung/flama-media/internal/handler.Version=${VERSION}' \
+            -X 'github.com/TrinhChung/flama-media/internal/handler.CommitSHA=${COMMIT_SHA}' \
+            -X 'github.com/TrinhChung/flama-media/internal/handler.BuildTime=${BUILD_TIME}'" \
+            -o flama-media ./cmd/server
+          ls -lh flama-media
+
+      - name: Deploy Binary to Worker 212 via SSH
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "flama-media"
+          target: "/tmp"
+          overwrite: true
+
+      - name: Atomic Deploy & Restart Systemd Service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+            echo "[DEPLOY] Installing new binary..."
+            sudo chmod +x /tmp/flama-media
+            if [ -f /opt/flama-media/bin/flama-media ]; then
+              sudo cp /opt/flama-media/bin/flama-media /opt/flama-media/bin/flama-media.bak
+            fi
+            sudo mv /tmp/flama-media /opt/flama-media/bin/flama-media
+            sudo chown ubuntu:ubuntu /opt/flama-media/bin/flama-media
+            
+            echo "[DEPLOY] Restarting flama-media.service..."
+            sudo systemctl restart flama-media
+            
+            echo "[DEPLOY] Verifying health..."
+            sleep 2
+            sudo systemctl is-active --quiet flama-media || (echo "Service failed to start! Rolling back..." && sudo mv /opt/flama-media/bin/flama-media.bak /opt/flama-media/bin/flama-media && sudo systemctl restart flama-media && exit 1)
+            
+            HEALTH=$(curl -s http://127.0.0.1:4792/health)
+            echo "Health response: $HEALTH"
+            echo "[DEPLOY] Deployment completed successfully!"
