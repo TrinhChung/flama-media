@@ -376,6 +376,8 @@ func (svc *Service) WrapStore(next http.Handler) http.Handler {
 }
 
 func (s *service) serve(w http.ResponseWriter, r *http.Request, name string) {
+	// Misses must not be cached: the edge would keep a 404 after the file exists.
+	w.Header().Set("Cache-Control", "no-store")
 	key, locale, c, ok := parseFilename(name)
 	if !ok {
 		http.NotFound(w, r)

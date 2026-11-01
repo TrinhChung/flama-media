@@ -184,9 +184,12 @@ func TestStoreServesAndGeneratesMissingStrokesOnly(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "stroke_ja_4e00.svg")); err != nil {
 		t.Fatal("generated stroke not stored")
 	}
+	if w.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Fatalf("stored stroke cache header %q", w.Header().Get("Cache-Control"))
+	}
 	for _, path := range []string{"/store/stroke_ja_004e00.svg", "/store/stroke_ja_1234.svg", "/store/stroke_xx_4e00.svg", "/store/stroke_ja_4e00.svg.bak"} {
-		if w := get(path); w.Code != http.StatusNotFound {
-			t.Fatalf("%s: %d", path, w.Code)
+		if w := get(path); w.Code != http.StatusNotFound || w.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("%s: %d cache %q", path, w.Code, w.Header().Get("Cache-Control"))
 		}
 	}
 	if w := get("/store/0b8ef6f9-6c3a-4c55-8a39-4a8c1d6a0f11"); w.Code != http.StatusTeapot {
