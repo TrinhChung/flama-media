@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -44,6 +46,11 @@ type ZipItemResult struct {
 	ContentType      string `json:"content_type,omitempty"`
 	Deduplicated     bool   `json:"deduplicated,omitempty"`
 	Error            string `json:"error,omitempty"`
+	StageID          string `json:"stage_id,omitempty"`
+	Filename         string `json:"filename,omitempty"`
+	Width            int    `json:"width,omitempty"`
+	Height           int    `json:"height,omitempty"`
+	ExpiresAt        int64  `json:"expires_at,omitempty"`
 }
 
 type ZipUploadResponse struct {
@@ -86,15 +93,19 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "INVALID_TOKEN", "Cryptographic signature check failed")
 		return
 	}
+	if ticket.Action != "upload" || ticket.UserID <= 0 || ticket.MaxBytes <= 0 {
+		writeJSONError(w, http.StatusForbidden, "INVALID_TICKET_SCOPE", "An owner-scoped upload ticket is required")
+		return
+	}
 
 	// Max zip payload size allowed (e.g. 50MB)
 	maxZipBytes := h.cfg.MaxUploadBytes * 2
-	if ticket.MaxBytes > 0 && ticket.MaxBytes*2 < maxZipBytes {
-		maxZipBytes = ticket.MaxBytes * 2
+	if ticket.MaxBytes > 0 && ticket.MaxBytes < maxZipBytes {
+		maxZipBytes = ticket.MaxBytes
 	}
 
 	// 2. Wrap body to prevent DoS / slow chunk attacks
-	r.Body = http.MaxBytesReader(w, r.Body, maxZipBytes+1024)
+	r.Body = http.MaxBytesReader(w, r.Body, maxZipBytes+(64<<10))
 
 	var zipBytes []byte
 	contentType := r.Header.Get("Content-Type")
@@ -133,6 +144,10 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		zipBytes = buf
 	}
+	if int64(len(zipBytes)) > maxZipBytes {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "ZIP archive exceeds allowed limits")
+		return
+	}
 
 	if len(zipBytes) < 22 {
 		writeJSONError(w, http.StatusBadRequest, "INVALID_ZIP", "File is too small to be a valid ZIP archive")
@@ -168,9 +183,9 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		cleanName := filepath.Clean(f.Name)
+		cleanName := path.Clean(strings.ReplaceAll(f.Name, "\\", "/"))
 		// Zip-Slip / Path Traversal Protection
-		if strings.HasPrefix(cleanName, "..") || strings.HasPrefix(cleanName, "/") || strings.HasPrefix(cleanName, "\\") || strings.Contains(f.Name, "../") {
+		if cleanName == ".." || strings.HasPrefix(cleanName, "../") || strings.HasPrefix(cleanName, "/") || strings.Contains(f.Name, "../") || strings.Contains(f.Name, "..\\") || strings.Contains(cleanName, ":") || f.Mode()&os.ModeSymlink != 0 {
 			results = append(results, ZipItemResult{
 				OriginalFilename: f.Name,
 				Error:            "unsafe filename path (traversal attempt)",
@@ -189,6 +204,10 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Zip Bomb Check 1: Compression ratio guard
+		if f.CompressedSize64 == 0 && f.UncompressedSize64 > 0 {
+			writeJSONError(w, http.StatusBadRequest, "ZIP_BOMB_DETECTED", "Invalid compressed entry size")
+			return
+		}
 		if f.CompressedSize64 > 0 {
 			ratio := f.UncompressedSize64 / f.CompressedSize64
 			if ratio > DefaultMaxCompressionRatio {
@@ -208,8 +227,7 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Zip Bomb Check 2: Total uncompressed size limit
-		totalUncompressed += int64(f.UncompressedSize64)
-		if totalUncompressed > DefaultMaxZipUncompressedSize {
+		if f.UncompressedSize64 > uint64(DefaultMaxZipUncompressedSize-totalUncompressed) {
 			if h.reporter != nil {
 				h.reporter.ReportIncidentAsync(reporter.SecurityIncident{
 					UserID:       ticket.UserID,
@@ -223,6 +241,7 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"Total uncompressed content exceeds 100MB limit (possible zip bomb)")
 			return
 		}
+		totalUncompressed += int64(f.UncompressedSize64)
 
 		// Read file content with hard limit
 		rc, err := f.Open()
@@ -237,7 +256,10 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Limit reading each entry
 		entryLimit := h.cfg.MaxUploadBytes
-		sanitized, err := sanitizer.InspectAndSanitize(rc, entryLimit, h.cfg.MaxImageDimension, h.cfg.MaxImagePixels)
+		if ticket.MaxBytes < entryLimit {
+			entryLimit = ticket.MaxBytes
+		}
+		sanitized, err := sanitizer.InspectAndSanitizeWithResize(rc, entryLimit, h.cfg.MaxImageDimension, h.cfg.MaxImagePixels, h.cfg.ResizeDimension)
 		_ = rc.Close()
 
 		if err != nil {
@@ -266,8 +288,8 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Save to CAS Deduplication storage
-		asset, err := h.storage.Save(sanitized.Data, sanitized.Extension, sanitized.ContentType)
+		// ZIP extraction produces owner-scoped stages; it does not commit notes.
+		asset, err := h.storage.Stage(sanitized.Data, sanitized.Extension, sanitized.ContentType, filepath.Base(cleanName), ticket.UserID, sanitized.Width, sanitized.Height, time.Duration(h.cfg.StageTTLSeconds)*time.Second)
 		if err != nil {
 			results = append(results, ZipItemResult{
 				OriginalFilename: f.Name,
@@ -279,12 +301,16 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		results = append(results, ZipItemResult{
 			OriginalFilename: f.Name,
-			AssetID:          asset.ID,
-			URL:              "/store/" + asset.ID,
+			AssetID:          asset.SHA256,
+			URL:              "/media/staged/" + asset.StageID,
 			SHA256:           asset.SHA256,
 			SizeBytes:        asset.SizeBytes,
 			ContentType:      asset.ContentType,
-			Deduplicated:     asset.Deduplicated,
+			StageID:          asset.StageID,
+			Filename:         asset.Filename,
+			Width:            asset.Width,
+			Height:           asset.Height,
+			ExpiresAt:        asset.ExpiresAt,
 		})
 		acceptedCount++
 	}

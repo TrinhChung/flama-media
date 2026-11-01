@@ -28,6 +28,9 @@ type UploadTicket struct {
 // VerifyToken validates an HMAC-SHA256 presigned token against the shared secret.
 // Format: <base64url_json_payload>.<hex_hmac_signature>
 func VerifyToken(token string, secret string) (*UploadTicket, error) {
+	if secret == "" || len(token) > 4096 {
+		return nil, ErrInvalidSignature
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
 		return nil, ErrInvalidTokenFormat
@@ -61,7 +64,7 @@ func VerifyToken(token string, secret string) (*UploadTicket, error) {
 	}
 
 	// 3. Verify expiration
-	if time.Now().Unix() > ticket.Exp {
+	if time.Now().Unix() >= ticket.Exp {
 		return nil, ErrTokenExpired
 	}
 

@@ -6,17 +6,26 @@ services:
     container_name: flama-media
     restart: unless-stopped
     ports:
-      # Lắng nghe trên port 4792 (chỉ mở cho mạng nội bộ/OV)
-      - "4792:4792"
+      # Set the private VPN bind address in host-specific configuration.
+      - "${MEDIA_BIND_HOST:-127.0.0.1}:4792:4792"
     environment:
       - PORT=4792
-      - MEDIA_SHARED_SECRET=${MEDIA_SHARED_SECRET}
-      - GATEWAY_SECRET=${GATEWAY_SECRET}
+      - LISTEN_HOST=0.0.0.0
+      - MEDIA_SHARED_SECRET=${MEDIA_SHARED_SECRET:?MEDIA_SHARED_SECRET is required}
+      - GATEWAY_SECRET=${GATEWAY_SECRET:?GATEWAY_SECRET is required}
+      - INTERNAL_SECURITY_SECRET=${INTERNAL_SECURITY_SECRET:?INTERNAL_SECURITY_SECRET is required}
       - MEDIA_STORAGE_ROOT=/data/flama/media
+      - MEDIA_STAGE_TTL_SECONDS=86400
       - MAX_UPLOAD_BYTES=20971520
+      - IMAGE_RESIZE_DIMENSION=1600
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}
+      - STROKE_ROLE=${STROKE_ROLE:-disabled}
+      - STROKE_DATASET_ROOT=${STROKE_DATASET_ROOT:-}
+      - STROKE_STORE_URL=${STROKE_STORE_URL:-}
+      - STROKE_STORE_SECRET=${STROKE_STORE_SECRET:-}
     volumes:
-      # Mount thư mục lưu trữ media trên Máy 212
-      - /data/flama/media:/data/flama/media
+      # Host systemd-tmpfiles must clean data/media/staging after one day.
+      - ${MEDIA_HOST_ROOT:-./data/media}:/data/flama/media
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:4792/health"]
       interval: 30s

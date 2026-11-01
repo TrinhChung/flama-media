@@ -39,7 +39,12 @@ func createValidToken(secret string) string {
 		UserID:   42,
 		MaxBytes: 10485760,
 		Exp:      time.Now().Unix() + 300,
+		Action:   "upload",
 	}
+	return createTicketToken(secret, ticket)
+}
+
+func createTicketToken(secret string, ticket auth.UploadTicket) string {
 	raw, _ := json.Marshal(ticket)
 	b64 := base64.RawURLEncoding.EncodeToString(raw)
 
@@ -101,5 +106,63 @@ func TestUploadZipHandler_ZipSlipProtection(t *testing.T) {
 	}
 	if rep.incidents[0].UserID != 42 {
 		t.Errorf("expected incident user_id 42, got %d", rep.incidents[0].UserID)
+	}
+}
+
+func TestZIPUploadStagesAcceptedMediaAndRejectsBackslashTraversal(t *testing.T) {
+	cfg := testMediaConfig()
+	store, _ := storage.NewDiskStorage(t.TempDir())
+	h := NewUploadZipHandler(cfg, store, nil)
+	var body bytes.Buffer
+	zw := zip.NewWriter(&body)
+	good, _ := zw.Create("audio/sound.mp3")
+	_, _ = good.Write(append([]byte("ID3"), bytes.Repeat([]byte{0}, 30)...))
+	bad, _ := zw.Create(`..\outside.mp3`)
+	_, _ = bad.Write(append([]byte("ID3"), bytes.Repeat([]byte{0}, 30)...))
+	_ = zw.Close()
+	r := httptest.NewRequest(http.MethodPost, "/media/upload-zip", &body)
+	r.Header.Set("Authorization", "Bearer "+createValidToken(cfg.SharedSecret))
+	r.Header.Set("Content-Type", "application/zip")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("zip %d: %s", w.Code, w.Body.String())
+	}
+	var result ZipUploadResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &result)
+	if result.AcceptedCount != 1 || result.RejectedCount != 1 || result.Items[0].StageID == "" {
+		t.Fatalf("zip result %+v", result)
+	}
+	if _, err := store.FindById(result.Items[0].SHA256); !os.IsNotExist(err) {
+		t.Fatal("ZIP committed media before note save")
+	}
+}
+
+func TestZIPPayloadHardLimitAndCompressionBomb(t *testing.T) {
+	cfg := testMediaConfig()
+	cfg.MaxUploadBytes = 64
+	store, _ := storage.NewDiskStorage(t.TempDir())
+	h := NewUploadZipHandler(cfg, store, nil)
+	r := httptest.NewRequest(http.MethodPost, "/media/upload-zip", bytes.NewReader(bytes.Repeat([]byte{0}, 200)))
+	r.Header.Set("Authorization", "Bearer "+createValidToken(cfg.SharedSecret))
+	r.Header.Set("Content-Type", "application/zip")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 413 {
+		t.Fatalf("oversized ZIP status=%d", w.Code)
+	}
+	cfg.MaxUploadBytes = 10 << 20
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	file, _ := zw.Create("bomb.mp3")
+	_, _ = file.Write(bytes.Repeat([]byte{0}, 1<<20))
+	_ = zw.Close()
+	r = httptest.NewRequest(http.MethodPost, "/media/upload-zip", &buf)
+	r.Header.Set("Authorization", "Bearer "+createValidToken(cfg.SharedSecret))
+	r.Header.Set("Content-Type", "application/zip")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 400 || !bytes.Contains(w.Body.Bytes(), []byte("ZIP_BOMB_DETECTED")) {
+		t.Fatalf("compression bomb status=%d: %s", w.Code, w.Body.String())
 	}
 }
