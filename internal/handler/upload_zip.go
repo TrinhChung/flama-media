@@ -97,6 +97,11 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "INVALID_TICKET_SCOPE", "An owner-scoped upload ticket is required")
 		return
 	}
+	preset, ok := sanitizer.ResolvePreset(ticket.Preset)
+	if !ok {
+		writeJSONError(w, http.StatusForbidden, "INVALID_TICKET_SCOPE", "Unknown image preset in upload ticket")
+		return
+	}
 
 	// Max zip payload size allowed (e.g. 50MB)
 	maxZipBytes := h.cfg.MaxUploadBytes * 2
@@ -259,7 +264,7 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ticket.MaxBytes < entryLimit {
 			entryLimit = ticket.MaxBytes
 		}
-		sanitized, err := sanitizer.InspectAndSanitizeWithResize(rc, entryLimit, h.cfg.MaxImageDimension, h.cfg.MaxImagePixels, h.cfg.ResizeDimension)
+		sanitized, err := sanitizer.InspectAndSanitizeWithPreset(rc, entryLimit, h.cfg.MaxImageDimension, h.cfg.MaxImagePixels, preset)
 		_ = rc.Close()
 
 		if err != nil {
