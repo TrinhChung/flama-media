@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"golang.org/x/image/draw"
-	_ "golang.org/x/image/webp"
+	xwebp "golang.org/x/image/webp"
 	"image"
 	"image/gif"
 	"image/jpeg"
@@ -41,6 +41,22 @@ func InspectAndSanitize(
 }
 
 func InspectAndSanitizeWithResize(r io.Reader, maxBytes int64, maxDimension, maxPixels, resizeDimension int) (*SanitizedMedia, error) {
+	return inspect(r, maxBytes, func(raw []byte, format, ext, mime string) (*SanitizedMedia, error) {
+		return sanitizeImage(raw, format, ext, mime, maxDimension, maxPixels, resizeDimension, maxBytes)
+	})
+}
+
+// InspectAndSanitizeWithPreset validates like InspectAndSanitize, but images are
+// auto-oriented, cropped/resized by preset and stored as WebP (Flask parity).
+func InspectAndSanitizeWithPreset(r io.Reader, maxBytes int64, maxDimension, maxPixels int, preset Preset) (*SanitizedMedia, error) {
+	return inspect(r, maxBytes, func(raw []byte, _, _, _ string) (*SanitizedMedia, error) {
+		return processImagePreset(raw, maxDimension, maxPixels, maxBytes, preset)
+	})
+}
+
+type imageSanitizer func(raw []byte, format, ext, mime string) (*SanitizedMedia, error)
+
+func inspect(r io.Reader, maxBytes int64, sanitizeImg imageSanitizer) (*SanitizedMedia, error) {
 	// Read payload into memory (bounded by maxBytes)
 	lr := io.LimitReader(r, maxBytes+1)
 	buf, err := io.ReadAll(lr)
@@ -69,13 +85,13 @@ func InspectAndSanitizeWithResize(r io.Reader, maxBytes int64, maxDimension, max
 
 	switch detectedType {
 	case "image/jpeg":
-		return sanitizeImage(buf, "jpeg", ".jpg", "image/jpeg", maxDimension, maxPixels, resizeDimension, maxBytes)
+		return sanitizeImg(buf, "jpeg", ".jpg", "image/jpeg")
 	case "image/png":
-		return sanitizeImage(buf, "png", ".png", "image/png", maxDimension, maxPixels, resizeDimension, maxBytes)
+		return sanitizeImg(buf, "png", ".png", "image/png")
 	case "image/gif":
-		return sanitizeImage(buf, "gif", ".gif", "image/gif", maxDimension, maxPixels, resizeDimension, maxBytes)
+		return sanitizeImg(buf, "gif", ".gif", "image/gif")
 	case "image/webp":
-		return sanitizeImage(buf, "png", ".png", "image/png", maxDimension, maxPixels, resizeDimension, maxBytes)
+		return sanitizeImg(buf, "png", ".png", "image/png")
 	case "audio/mpeg", "audio/mp3", "application/octet-stream":
 		// Handle MP3 detection fallback (often flagged as octet-stream by DetectContentType)
 		if isMP3(buf) {
@@ -135,7 +151,7 @@ func sanitizeImage(
 	maxBytes int64,
 ) (*SanitizedMedia, error) {
 	// 1. DecodeConfig ONLY (checks dimensions without allocating massive RAM)
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	cfg, _, err := decodeConfig(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorruptMediaFile, err)
 	}
@@ -151,7 +167,7 @@ func sanitizeImage(
 	}
 
 	// 2. Full Decode to extract raw pixels
-	img, _, err := image.Decode(bytes.NewReader(raw))
+	img, _, err := decodeImage(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorruptMediaFile, err)
 	}
@@ -198,6 +214,29 @@ func sanitizeImage(
 		Width:       width,
 		Height:      height,
 	}, nil
+}
+
+// decodeConfig and decodeImage pin WebP decoding to golang.org/x/image/webp: the
+// WebP encoder package also registers a "webp" format with image.Decode, and its
+// decoder returns lossy YCbCr pixels for lossless input.
+func decodeConfig(raw []byte) (image.Config, string, error) {
+	if isWebP(raw) {
+		cfg, err := xwebp.DecodeConfig(bytes.NewReader(raw))
+		return cfg, "webp", err
+	}
+	return image.DecodeConfig(bytes.NewReader(raw))
+}
+
+func decodeImage(raw []byte) (image.Image, string, error) {
+	if isWebP(raw) {
+		img, err := xwebp.Decode(bytes.NewReader(raw))
+		return img, "webp", err
+	}
+	return image.Decode(bytes.NewReader(raw))
+}
+
+func isWebP(b []byte) bool {
+	return len(b) >= 12 && string(b[0:4]) == "RIFF" && string(b[8:12]) == "WEBP"
 }
 
 func isMP3(b []byte) bool {

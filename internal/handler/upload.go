@@ -103,13 +103,19 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// 4. Sanitize, verify magic bytes, and re-encode images (stripping EXIF/payloads)
-	sanitized, err := sanitizer.InspectAndSanitizeWithResize(
+	// 4. Sanitize, verify magic bytes, and re-encode images to WebP using the
+	// preset the backend signed into the ticket (stripping EXIF/payloads)
+	preset, ok := sanitizer.ResolvePreset(ticket.Preset)
+	if !ok {
+		writeJSONError(w, http.StatusForbidden, "INVALID_TICKET_SCOPE", "Unknown image preset in upload ticket")
+		return
+	}
+	sanitized, err := sanitizer.InspectAndSanitizeWithPreset(
 		file,
 		maxBytes,
 		h.cfg.MaxImageDimension,
 		h.cfg.MaxImagePixels,
-		h.cfg.ResizeDimension,
+		preset,
 	)
 	if err != nil {
 		if errors.Is(err, sanitizer.ErrDecompressionBomb) && h.reporter != nil {

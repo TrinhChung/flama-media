@@ -57,8 +57,8 @@ func Load() *Config {
 		StorageRoot:         getEnv("MEDIA_STORAGE_ROOT", "./data/media"),
 		TempRoot:            getEnv("MEDIA_TEMP_ROOT", "./data/tmp"),
 		MaxUploadBytes:      getInt64Env("MAX_UPLOAD_BYTES", 20*1024*1024), // 20MB
-		MaxImageDimension:   getIntEnv("MAX_IMAGE_DIMENSION", 4096),
-		MaxImagePixels:      getIntEnv("MAX_IMAGE_PIXELS", 16000000), // 16 MegaPixels
+		MaxImageDimension:   getIntEnv("MAX_IMAGE_DIMENSION", 16384), // images are resized after decoding
+		MaxImagePixels:      getIntEnv("MAX_IMAGE_PIXELS", 50000000), // 50 MP covers phone cameras
 		AllowedOrigins:      getEnv("ALLOWED_ORIGINS", ""),
 		TrustedProxies:      trustedProxies,
 		StageTTLSeconds:     getIntEnv("MEDIA_STAGE_TTL_SECONDS", 86400),

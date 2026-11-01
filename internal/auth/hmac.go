@@ -23,6 +23,8 @@ type UploadTicket struct {
 	MaxBytes int64  `json:"max_bytes"`
 	Exp      int64  `json:"exp"`
 	Action   string `json:"action"`
+	// Preset names the image output profile (sanitizer presets); empty means note_image.
+	Preset string `json:"preset,omitempty"`
 }
 
 // VerifyToken validates an HMAC-SHA256 presigned token against the shared secret.
