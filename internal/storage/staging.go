@@ -221,8 +221,42 @@ func (s *DiskStorage) OpenStage(stageID string) (*os.File, error) {
 	return os.Open(s.stagePathLocked(record))
 }
 
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func (s *DiskStorage) aliasPath(id string) string {
 	return filepath.Join(s.rootDir, "aliases", id[:2], id+".json")
+}
+
+// linkAliasLocked adds the same id symlink the migrated library uses,
+// <id[0:2]>/<id[2:4]>/<id><ext> -> ../../<cas path>, so every asset on disk can be
+// served by id from the directory alone (for example by nginx) without the JSON record.
+func (s *DiskStorage) linkAliasLocked(id, relative string) error {
+	link := filepath.Join(s.rootDir, id[0:2], id[2:4], id+filepath.Ext(relative))
+	target := filepath.ToSlash(filepath.Join("..", "..", filepath.FromSlash(relative)))
+	if current, err := os.Readlink(link); err == nil {
+		if filepath.ToSlash(current) == target {
+			return nil
+		}
+		return ErrAliasConflict
+	} else if _, statErr := os.Lstat(link); statErr == nil {
+		return ErrAliasConflict // a regular file already owns this id
+	}
+	if err := os.MkdirAll(filepath.Dir(link), 0750); err != nil {
+		return err
+	}
+	tmp := link + ".tmp-" + randomHex(8)
+	if err := os.Symlink(target, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, link); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDirectory(filepath.Dir(link))
 }
 
 func (s *DiskStorage) readAliasLocked(id string) (*StagedAsset, error) {
@@ -315,6 +349,9 @@ func (s *DiskStorage) CommitStages(userID int64, items []CommitItem) ([]StagedAs
 		record.RelativePath, record.AssetID, record.Committed = relative, items[i].AssetID, true
 		aliasData, _ := json.Marshal(record.StagedAsset)
 		if err := atomicWrite(s.aliasPath(record.AssetID), aliasData); err != nil {
+			return nil, err
+		}
+		if err := s.linkAliasLocked(record.AssetID, relative); err != nil {
 			return nil, err
 		}
 		metadata, _ := json.Marshal(record)

@@ -59,6 +59,13 @@ func TestStagingCommitUsesRenameAndSurvivesRestart(t *testing.T) {
 	if committed[0].AssetID != aliasOne || committed[0].SHA256 != stage.SHA256 {
 		t.Fatalf("bad receipt: %+v", committed)
 	}
+	link := filepath.Join(root, aliasOne[0:2], aliasOne[2:4], aliasOne+".mp3")
+	if target, err := os.Readlink(link); err != nil || filepath.ToSlash(target) != "../../"+committed[0].RelativePath {
+		t.Fatalf("id symlink: %q %v", target, err)
+	}
+	if linked, err := os.Stat(link); err != nil || !os.SameFile(linked, after) {
+		t.Fatalf("id symlink does not reach the CAS file: %v", err)
+	}
 	if _, err := restarted.CommitStages(7, items); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
