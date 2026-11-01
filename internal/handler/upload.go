@@ -31,6 +31,11 @@ type UploadResponse struct {
 	SizeBytes    int64  `json:"size_bytes"`
 	ContentType  string `json:"content_type"`
 	Deduplicated bool   `json:"deduplicated"`
+	StageID      string `json:"stage_id"`
+	Filename     string `json:"filename"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	ExpiresAt    int64  `json:"expires_at"`
 }
 
 func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +71,10 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, "INVALID_TOKEN", "Cryptographic signature check failed")
 		return
 	}
+	if ticket.Action != "upload" || ticket.UserID <= 0 || ticket.MaxBytes <= 0 {
+		writeJSONError(w, http.StatusForbidden, "INVALID_TICKET_SCOPE", "An owner-scoped upload ticket is required")
+		return
+	}
 
 	// Determine max upload size allowed (min of ticket limit and server global limit)
 	maxBytes := h.cfg.MaxUploadBytes
@@ -74,7 +83,7 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Wrap request body with MaxBytesReader to protect against Slowloris / Memory exhaustion
-	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+1024)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+(64<<10))
 
 	// 3. Parse Multipart Form (1MB in memory, rest spills to disk if needed)
 	if err := r.ParseMultipartForm(1 << 20); err != nil {
@@ -87,19 +96,26 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	file, _, err := r.FormFile("file")
+	file, header, err := r.FormFile("file")
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "MISSING_FILE", "No file found under 'file' form field")
 		return
 	}
 	defer file.Close()
 
-	// 4. Sanitize, verify magic bytes, and re-encode images (stripping EXIF/payloads)
-	sanitized, err := sanitizer.InspectAndSanitize(
+	// 4. Sanitize, verify magic bytes, and re-encode images to WebP using the
+	// preset the backend signed into the ticket (stripping EXIF/payloads)
+	preset, ok := sanitizer.ResolvePreset(ticket.Preset)
+	if !ok {
+		writeJSONError(w, http.StatusForbidden, "INVALID_TICKET_SCOPE", "Unknown image preset in upload ticket")
+		return
+	}
+	sanitized, err := sanitizer.InspectAndSanitizeWithPreset(
 		file,
 		maxBytes,
 		h.cfg.MaxImageDimension,
 		h.cfg.MaxImagePixels,
+		preset,
 	)
 	if err != nil {
 		if errors.Is(err, sanitizer.ErrDecompressionBomb) && h.reporter != nil {
@@ -123,26 +139,23 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Save to disk under random UUIDv4
-	asset, err := h.storage.Save(sanitized.Data, sanitized.Extension, sanitized.ContentType)
+	// 5. Stage only. A backend-authorized commit promotes bytes into durable CAS.
+	asset, err := h.storage.Stage(sanitized.Data, sanitized.Extension, sanitized.ContentType, header.Filename, ticket.UserID, sanitized.Width, sanitized.Height, time.Duration(h.cfg.StageTTLSeconds)*time.Second)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "STORAGE_ERROR", "Failed to persist media asset")
 		return
 	}
 
 	// 6. Return response with canonical Flama store URL
-	resp := UploadResponse{
-		AssetID:      asset.ID,
-		URL:          "/store/" + asset.ID,
-		SHA256:       asset.SHA256,
-		SizeBytes:    asset.SizeBytes,
-		ContentType:  asset.ContentType,
-		Deduplicated: asset.Deduplicated,
-	}
+	resp := stageUploadResponse(asset)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func stageUploadResponse(asset *storage.StagedAsset) UploadResponse {
+	return UploadResponse{AssetID: asset.SHA256, URL: "/media/staged/" + asset.StageID, SHA256: asset.SHA256, SizeBytes: asset.SizeBytes, ContentType: asset.ContentType, StageID: asset.StageID, Filename: asset.Filename, Width: asset.Width, Height: asset.Height, ExpiresAt: asset.ExpiresAt}
 }
 
 func extractClientIP(r *http.Request) string {

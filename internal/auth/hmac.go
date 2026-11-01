@@ -23,11 +23,16 @@ type UploadTicket struct {
 	MaxBytes int64  `json:"max_bytes"`
 	Exp      int64  `json:"exp"`
 	Action   string `json:"action"`
+	// Preset names the image output profile (sanitizer presets); empty means note_image.
+	Preset string `json:"preset,omitempty"`
 }
 
 // VerifyToken validates an HMAC-SHA256 presigned token against the shared secret.
 // Format: <base64url_json_payload>.<hex_hmac_signature>
 func VerifyToken(token string, secret string) (*UploadTicket, error) {
+	if secret == "" || len(token) > 4096 {
+		return nil, ErrInvalidSignature
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
 		return nil, ErrInvalidTokenFormat
@@ -61,7 +66,7 @@ func VerifyToken(token string, secret string) (*UploadTicket, error) {
 	}
 
 	// 3. Verify expiration
-	if time.Now().Unix() > ticket.Exp {
+	if time.Now().Unix() >= ticket.Exp {
 		return nil, ErrTokenExpired
 	}
 

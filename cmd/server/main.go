@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,53 +16,74 @@ import (
 	"github.com/TrinhChung/flama-media/internal/handler"
 	"github.com/TrinhChung/flama-media/internal/reporter"
 	"github.com/TrinhChung/flama-media/internal/storage"
+	"github.com/TrinhChung/flama-media/internal/stroke"
 )
 
 func main() {
 	log.Println("[INFO] Initializing Flama Media Service (Go)...")
 	cfg := config.Load()
-
-	// Initialize disk storage
-	store, err := storage.NewDiskStorage(cfg.StorageRoot)
-	if err != nil {
-		log.Fatalf("[FATAL] Failed to initialize storage: %v", err)
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("[FATAL] Invalid configuration: %v", err)
 	}
 
-	// Initialize security incident reporter to Chung VPS
-	incidentReporter := reporter.NewHTTPReporter(cfg.SecurityCallbackURL, cfg.InternalSecret)
-	defer incidentReporter.Close()
-
-	// Handlers
-	uploadHandler := handler.NewUploadHandler(cfg, store, incidentReporter)
-	uploadZipHandler := handler.NewUploadZipHandler(cfg, store, incidentReporter)
-	serveHandler := handler.NewServeHandler(cfg, store)
-
 	mux := http.NewServeMux()
-
-	// Health check
 	mux.HandleFunc("GET /health", handler.HealthCheck)
+	strokes, err := stroke.Register(mux, stroke.Options{Role: cfg.StrokeRole, InternalSecret: cfg.InternalSecret, DatasetRoot: cfg.StrokeDatasetRoot, StorageRoot: cfg.StrokeStorageRoot})
+	if err != nil {
+		log.Fatalf("[FATAL] Stroke configuration: %v", err)
+	}
 
-	// Single media upload routes
-	mux.Handle("POST /media/upload", uploadHandler)
-	mux.Handle("POST /upload", uploadHandler)
+	{
+		// Initialize disk storage
+		store, err := storage.NewDiskStorage(cfg.StorageRoot)
+		if err != nil {
+			log.Fatalf("[FATAL] Failed to initialize storage: %v", err)
+		}
 
-	// Batch ZIP media upload routes (Anki packages, media zip packages)
-	mux.Handle("POST /media/upload-zip", uploadZipHandler)
-	mux.Handle("POST /upload-zip", uploadZipHandler)
+		// Initialize security incident reporter to Chung VPS
+		incidentReporter := reporter.NewHTTPReporter(cfg.SecurityCallbackURL, cfg.InternalSecret)
+		defer incidentReporter.Close()
 
-	// Media serve routes (Supports /store/, /media/store/, and legacy /media/proxy/)
-	mux.Handle("GET /store/", serveHandler)
-	mux.Handle("HEAD /store/", serveHandler)
-	mux.Handle("GET /media/store/", serveHandler)
-	mux.Handle("HEAD /media/store/", serveHandler)
-	mux.Handle("GET /media/proxy/", serveHandler)
-	mux.Handle("HEAD /media/proxy/", serveHandler)
+		// Handlers
+		uploadHandler := handler.NewUploadHandler(cfg, store, incidentReporter)
+		uploadZipHandler := handler.NewUploadZipHandler(cfg, store, incidentReporter)
+		var serveHandler http.Handler = handler.NewServeHandler(cfg, store)
+		if strokes != nil {
+			// GET /store/stroke_*.svg: generated on worker212, copied by OV nginx on a miss.
+			serveHandler = strokes.WrapStore(serveHandler)
+		}
+		stagingHandler := handler.NewStagingHandler(cfg, store)
+		mux.Handle("POST /media/commit", stagingHandler)
+		mux.Handle("POST /media/staged/inspect", stagingHandler)
+		mux.Handle("POST /media/assets/inspect", stagingHandler)
+		mux.Handle("GET /media/staged/", stagingHandler)
+		mux.Handle("HEAD /media/staged/", stagingHandler)
+
+		// Public URL download for the backend (crawl); private network only
+		mux.Handle("POST /media/fetch-url", handler.NewFetchHandler(cfg))
+
+		// Single media upload routes
+		mux.Handle("POST /media/upload", uploadHandler)
+		mux.Handle("POST /upload", uploadHandler)
+
+		// Batch ZIP media upload routes (Anki packages, media zip packages)
+		mux.Handle("POST /media/upload-zip", uploadZipHandler)
+		mux.Handle("POST /upload-zip", uploadZipHandler)
+
+		// Media serve routes (Supports /store/, /media/store/, and legacy /media/proxy/)
+		mux.Handle("GET /store/", serveHandler)
+		mux.Handle("HEAD /store/", serveHandler)
+		mux.Handle("GET /media/store/", serveHandler)
+		mux.Handle("HEAD /media/store/", serveHandler)
+		mux.Handle("GET /media/proxy/", serveHandler)
+		mux.Handle("HEAD /media/proxy/", serveHandler)
+	}
 
 	// Apply Middlewares: Gateway Security Check + Request Logging
-	wrappedMux := gatewaySecurityMiddleware(cfg, loggingMiddleware(mux))
+	wrappedMux := loggingMiddleware(gatewaySecurityMiddleware(cfg, corsMiddleware(cfg, mux)))
 
 	server := &http.Server{
-		Addr:         ":" + cfg.Port,
+		Addr:         net.JoinHostPort(cfg.ListenHost, cfg.Port),
 		Handler:      wrappedMux,
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 60 * time.Second,
@@ -101,11 +124,19 @@ func gatewaySecurityMiddleware(cfg *config.Config, next http.Handler) http.Handl
 			next.ServeHTTP(w, r)
 			return
 		}
+		if r.URL.Path == "/media/commit" || r.URL.Path == "/media/staged/inspect" || r.URL.Path == "/media/assets/inspect" || strings.HasPrefix(r.URL.Path, "/internal/strokes/") {
+			if cfg.InternalSecret == "" || !hmac.Equal([]byte(r.Header.Get("X-Internal-Secret")), []byte(cfg.InternalSecret)) {
+				http.Error(w, `{"error":"INTERNAL_ACCESS_DENIED"}`, http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		// 1. If GATEWAY_SECRET is configured, require matching header from OV Nginx
 		if cfg.GatewaySecret != "" {
 			reqSecret := r.Header.Get("X-Flama-Gateway-Secret")
-			if reqSecret == "" || reqSecret != cfg.GatewaySecret {
+			if reqSecret == "" || !hmac.Equal([]byte(reqSecret), []byte(cfg.GatewaySecret)) {
 				log.Printf("[SECURITY] Rejected direct request without valid gateway secret from: %s", r.RemoteAddr)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
@@ -116,14 +147,15 @@ func gatewaySecurityMiddleware(cfg *config.Config, next http.Handler) http.Handl
 
 		// 2. If TrustedProxies are configured, verify remote address
 		if len(cfg.TrustedProxies) > 0 {
-			clientIP := r.RemoteAddr
-			if colonIdx := strings.LastIndex(clientIP, ":"); colonIdx != -1 {
-				clientIP = clientIP[:colonIdx]
+			clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				clientIP = r.RemoteAddr
 			}
 
 			trusted := false
 			for _, proxy := range cfg.TrustedProxies {
-				if clientIP == proxy || proxy == "*" {
+				_, subnet, err := net.ParseCIDR(proxy)
+				if clientIP == proxy || (err == nil && subnet.Contains(net.ParseIP(clientIP))) {
 					trusted = true
 					break
 				}
@@ -137,6 +169,34 @@ func gatewaySecurityMiddleware(cfg *config.Config, next http.Handler) http.Handl
 			}
 		}
 
+		next.ServeHTTP(w, r)
+	})
+}
+
+func corsMiddleware(cfg *config.Config, next http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, origin := range strings.Split(cfg.AllowedOrigins, ",") {
+		if origin = strings.TrimSpace(origin); origin != "" && origin != "*" {
+			allowed[origin] = true
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if !allowed[origin] {
+				http.Error(w, `{"error":"ORIGIN_FORBIDDEN"}`, http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "600")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
 		next.ServeHTTP(w, r)
 	})
 }

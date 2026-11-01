@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"golang.org/x/image/draw"
+	xwebp "golang.org/x/image/webp"
 	"image"
 	"image/gif"
 	"image/jpeg"
@@ -35,6 +37,26 @@ func InspectAndSanitize(
 	maxDimension int,
 	maxPixels int,
 ) (*SanitizedMedia, error) {
+	return InspectAndSanitizeWithResize(r, maxBytes, maxDimension, maxPixels, 1600)
+}
+
+func InspectAndSanitizeWithResize(r io.Reader, maxBytes int64, maxDimension, maxPixels, resizeDimension int) (*SanitizedMedia, error) {
+	return inspect(r, maxBytes, func(raw []byte, format, ext, mime string) (*SanitizedMedia, error) {
+		return sanitizeImage(raw, format, ext, mime, maxDimension, maxPixels, resizeDimension, maxBytes)
+	})
+}
+
+// InspectAndSanitizeWithPreset validates like InspectAndSanitize, but images are
+// auto-oriented, cropped/resized by preset and stored as WebP (Flask parity).
+func InspectAndSanitizeWithPreset(r io.Reader, maxBytes int64, maxDimension, maxPixels int, preset Preset) (*SanitizedMedia, error) {
+	return inspect(r, maxBytes, func(raw []byte, _, _, _ string) (*SanitizedMedia, error) {
+		return processImagePreset(raw, maxDimension, maxPixels, maxBytes, preset)
+	})
+}
+
+type imageSanitizer func(raw []byte, format, ext, mime string) (*SanitizedMedia, error)
+
+func inspect(r io.Reader, maxBytes int64, sanitizeImg imageSanitizer) (*SanitizedMedia, error) {
 	// Read payload into memory (bounded by maxBytes)
 	lr := io.LimitReader(r, maxBytes+1)
 	buf, err := io.ReadAll(lr)
@@ -56,14 +78,20 @@ func InspectAndSanitize(
 		bytes.Contains(bytes.ToLower(buf[:min(len(buf), 512)]), []byte("<?xml")) {
 		return nil, ErrDisallowedSVG
 	}
+	// Match the existing Flask media validator's bounded EBML magic check.
+	if len(buf) >= 4 && bytes.Equal(buf[:4], []byte{0x1a, 0x45, 0xdf, 0xa3}) {
+		return &SanitizedMedia{Data: buf, ContentType: "audio/webm", Extension: ".webm"}, nil
+	}
 
 	switch detectedType {
 	case "image/jpeg":
-		return sanitizeImage(buf, "jpeg", ".jpg", "image/jpeg", maxDimension, maxPixels)
+		return sanitizeImg(buf, "jpeg", ".jpg", "image/jpeg")
 	case "image/png":
-		return sanitizeImage(buf, "png", ".png", "image/png", maxDimension, maxPixels)
+		return sanitizeImg(buf, "png", ".png", "image/png")
 	case "image/gif":
-		return sanitizeImage(buf, "gif", ".gif", "image/gif", maxDimension, maxPixels)
+		return sanitizeImg(buf, "gif", ".gif", "image/gif")
+	case "image/webp":
+		return sanitizeImg(buf, "png", ".png", "image/png")
 	case "audio/mpeg", "audio/mp3", "application/octet-stream":
 		// Handle MP3 detection fallback (often flagged as octet-stream by DetectContentType)
 		if isMP3(buf) {
@@ -91,6 +119,9 @@ func InspectAndSanitize(
 		}
 		return nil, ErrUnsupportedMediaType
 	case "audio/ogg", "application/ogg":
+		if !isOGG(buf) {
+			return nil, ErrCorruptMediaFile
+		}
 		return &SanitizedMedia{
 			Data:        buf,
 			ContentType: "audio/ogg",
@@ -116,9 +147,11 @@ func sanitizeImage(
 	mime string,
 	maxDim int,
 	maxPixels int,
+	resizeDimension int,
+	maxBytes int64,
 ) (*SanitizedMedia, error) {
 	// 1. DecodeConfig ONLY (checks dimensions without allocating massive RAM)
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	cfg, _, err := decodeConfig(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorruptMediaFile, err)
 	}
@@ -129,14 +162,30 @@ func sanitizeImage(
 	if cfg.Width > maxDim || cfg.Height > maxDim {
 		return nil, fmt.Errorf("%w: dimension %dx%d exceeds %d", ErrDecompressionBomb, cfg.Width, cfg.Height, maxDim)
 	}
-	if cfg.Width*cfg.Height > maxPixels {
+	if int64(cfg.Width)*int64(cfg.Height) > int64(maxPixels) {
 		return nil, fmt.Errorf("%w: total pixels %d exceeds %d", ErrDecompressionBomb, cfg.Width*cfg.Height, maxPixels)
 	}
 
 	// 2. Full Decode to extract raw pixels
-	img, _, err := image.Decode(bytes.NewReader(raw))
+	img, _, err := decodeImage(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorruptMediaFile, err)
+	}
+	width, height := cfg.Width, cfg.Height
+	if resizeDimension <= 0 {
+		resizeDimension = 1600
+	}
+	if width > resizeDimension || height > resizeDimension {
+		if width >= height {
+			height = max(1, height*resizeDimension/width)
+			width = resizeDimension
+		} else {
+			width = max(1, width*resizeDimension/height)
+			height = resizeDimension
+		}
+		resized := image.NewNRGBA(image.Rect(0, 0, width, height))
+		draw.ApproxBiLinear.Scale(resized, resized.Bounds(), img, img.Bounds(), draw.Src, nil)
+		img = resized
 	}
 
 	// 3. Re-encode into a clean new byte buffer (stripping 100% of EXIF, GPS, camera and polyglot payloads)
@@ -154,14 +203,40 @@ func sanitizeImage(
 	if err != nil {
 		return nil, fmt.Errorf("re-encoding failed: %w", err)
 	}
+	if int64(cleanBuf.Len()) > maxBytes {
+		return nil, fmt.Errorf("sanitized file exceeds maximum allowed size")
+	}
 
 	return &SanitizedMedia{
 		Data:        cleanBuf.Bytes(),
 		ContentType: mime,
 		Extension:   ext,
-		Width:       cfg.Width,
-		Height:      cfg.Height,
+		Width:       width,
+		Height:      height,
 	}, nil
+}
+
+// decodeConfig and decodeImage pin WebP decoding to golang.org/x/image/webp: the
+// WebP encoder package also registers a "webp" format with image.Decode, and its
+// decoder returns lossy YCbCr pixels for lossless input.
+func decodeConfig(raw []byte) (image.Config, string, error) {
+	if isWebP(raw) {
+		cfg, err := xwebp.DecodeConfig(bytes.NewReader(raw))
+		return cfg, "webp", err
+	}
+	return image.DecodeConfig(bytes.NewReader(raw))
+}
+
+func decodeImage(raw []byte) (image.Image, string, error) {
+	if isWebP(raw) {
+		img, err := xwebp.Decode(bytes.NewReader(raw))
+		return img, "webp", err
+	}
+	return image.Decode(bytes.NewReader(raw))
+}
+
+func isWebP(b []byte) bool {
+	return len(b) >= 12 && string(b[0:4]) == "RIFF" && string(b[8:12]) == "WEBP"
 }
 
 func isMP3(b []byte) bool {

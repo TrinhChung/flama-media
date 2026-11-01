@@ -111,6 +111,8 @@ func getMimeByExt(ext string) string {
 		return "audio/ogg"
 	case ".wav":
 		return "audio/wav"
+	case ".webm":
+		return "audio/webm"
 	case ".m4a":
 		return "audio/mp4"
 	case ".aac":

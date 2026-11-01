@@ -23,13 +23,20 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.27.3'
           cache: true
 
       - name: Run Tests
         run: |
           go vet ./...
           go test -v -race ./...
+
+      - name: Verify production Linux ARM64 build
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: go build -trimpath -o "$RUNNER_TEMP/flama-media-arm64" ./cmd/server
 
   build-and-deploy:
     name: Build ARM64 Binary & Deploy
@@ -43,7 +50,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.27.3'
           cache: true
 
       - name: Build Binary for Linux ARM64

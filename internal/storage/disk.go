@@ -43,6 +43,13 @@ func NewDiskStorage(rootDir string) (*DiskStorage, error) {
 func (s *DiskStorage) Save(data []byte, ext string, contentType string) (*SavedAsset, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.saveLocked(data, ext, contentType)
+}
+
+func (s *DiskStorage) saveLocked(data []byte, ext string, contentType string) (*SavedAsset, error) {
+	if !validMediaExtension(ext) {
+		return nil, fmt.Errorf("unsupported media extension")
+	}
 
 	// 1. Compute SHA256 of sanitized payload
 	hash := sha256.Sum256(data)
@@ -124,6 +131,14 @@ func (s *DiskStorage) FindById(id string) (string, error) {
 
 	reqExt := strings.ToLower(filepath.Ext(id))
 	baseID := strings.TrimSuffix(id, reqExt)
+	if uuidPattern.MatchString(baseID) {
+		if alias, err := s.readAliasLocked(baseID); err == nil {
+			if reqExt != "" && reqExt != filepath.Ext(alias.RelativePath) {
+				return "", os.ErrNotExist
+			}
+			return filepath.Join(s.rootDir, filepath.FromSlash(alias.RelativePath)), nil
+		}
+	}
 
 	if len(baseID) < 4 {
 		return "", fmt.Errorf("invalid asset id")
