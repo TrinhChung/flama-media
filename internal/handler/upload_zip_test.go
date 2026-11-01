@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"image"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -164,5 +166,40 @@ func TestZIPPayloadHardLimitAndCompressionBomb(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != 400 || !bytes.Contains(w.Body.Bytes(), []byte("ZIP_BOMB_DETECTED")) {
 		t.Fatalf("compression bomb status=%d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestZIPImagesUseSignedPresetAndWebP(t *testing.T) {
+	cfg := testMediaConfig()
+	store, _ := storage.NewDiskStorage(t.TempDir())
+	var picture, archive bytes.Buffer
+	_ = png.Encode(&picture, image.NewNRGBA(image.Rect(0, 0, 640, 320)))
+	zw := zip.NewWriter(&archive)
+	entry, _ := zw.Create("picture.png")
+	_, _ = entry.Write(picture.Bytes())
+	_ = zw.Close()
+	for _, preset := range []string{"avatar", "unknown"} {
+		ticket := auth.UploadTicket{UserID: 42, MaxBytes: 1 << 20,
+			Exp: time.Now().Add(time.Hour).Unix(), Action: "upload", Preset: preset}
+		r := httptest.NewRequest(http.MethodPost, "/media/upload-zip", bytes.NewReader(archive.Bytes()))
+		r.Header.Set("Authorization", "Bearer "+createTicketToken(cfg.SharedSecret, ticket))
+		r.Header.Set("Content-Type", "application/zip")
+		w := httptest.NewRecorder()
+		NewUploadZipHandler(cfg, store, nil).ServeHTTP(w, r)
+		if preset == "unknown" {
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("unknown preset status=%d", w.Code)
+			}
+			continue
+		}
+		var result ZipUploadResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &result)
+		if w.Code != 200 || result.AcceptedCount != 1 || len(result.Items) != 1 {
+			t.Fatalf("ZIP preset response %d: %s", w.Code, w.Body.String())
+		}
+		item := result.Items[0]
+		if item.ContentType != "image/webp" || item.Width != 256 || item.Height != 256 || item.StageID == "" {
+			t.Fatalf("ZIP ignored signed avatar preset: %+v", item)
+		}
 	}
 }
