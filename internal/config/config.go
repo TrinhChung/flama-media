@@ -32,7 +32,7 @@ func Load() *Config {
 
 	gatewaySecret := getEnv("GATEWAY_SECRET", "")
 	internalSecret := getEnv("INTERNAL_SECURITY_SECRET", gatewaySecret)
-	securityCallbackURL := getEnv("SECURITY_CALLBACK_URL", "http://10.10.0.4:4789/api/v1/internal/security/incident")
+	securityCallbackURL := getEnv("SECURITY_CALLBACK_URL", "http://10.10.0.4:4789/api/internal/security/incident")
 
 	trustedProxiesStr := getEnv("TRUSTED_PROXIES", "")
 	var trustedProxies []string
