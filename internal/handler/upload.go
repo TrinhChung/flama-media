@@ -130,10 +130,10 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 6. Return response with canonical Flama proxy URL
+	// 6. Return response with canonical Flama store URL
 	resp := UploadResponse{
 		AssetID:      asset.ID,
-		URL:          "/media/proxy/" + asset.ID,
+		URL:          "/store/" + asset.ID,
 		SHA256:       asset.SHA256,
 		SizeBytes:    asset.SizeBytes,
 		ContentType:  asset.ContentType,

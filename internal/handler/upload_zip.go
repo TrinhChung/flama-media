@@ -280,7 +280,7 @@ func (h *UploadZipHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		results = append(results, ZipItemResult{
 			OriginalFilename: f.Name,
 			AssetID:          asset.ID,
-			URL:              "/media/proxy/" + asset.ID,
+			URL:              "/store/" + asset.ID,
 			SHA256:           asset.SHA256,
 			SizeBytes:        asset.SizeBytes,
 			ContentType:      asset.ContentType,
