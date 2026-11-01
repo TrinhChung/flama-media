@@ -10,7 +10,8 @@ và sinh SVG stroke. Media được lưu lâu dài trên 212. **OV** chỉ chạ
 2. Frontend gửi byte trực tiếp tới cổng media, proxy sang Go trên 212. Flask
    không nhận multipart của luồng trực tiếp này.
 3. Go kiểm tra ticket, giới hạn byte/pixel, giải mã và re-encode ảnh, resize giữ
-   tỉ lệ tối đa 1600px. JPEG/PNG/GIF/WebP được đọc; WebP được ghi thành PNG.
+   tỉ lệ tối đa 1600px. JPEG/PNG/GIF/WebP được đọc; preset `note_image` ghi WebP
+   quality 90 như luồng Flask trước đây, có xử lý hướng EXIF.
    ZIP có giới hạn entry/tổng giải nén/tỉ lệ nén và chặn đường dẫn không an toàn.
 4. Go ghi staging có tên ngẫu nhiên, trả `/media/staged/stg_<id>` để preview.
 5. Khi người dùng lưu thẻ, Flask xác thực quyền sửa, kiểm tra metadata/quota,
@@ -47,7 +48,7 @@ bind mount. Mẫu generic (thay đường dẫn/user cho đúng host):
 
 ```text
 # /etc/tmpfiles.d/flama-media.conf
-e /data/flama/media/staging 0750 flama flama 1d -
+d /data/flama/media/staging 0750 flama flama mM:1d -
 ```
 
 Không dựa vào chính sách mặc định của `/tmp`: thời hạn và filesystem có thể khác
