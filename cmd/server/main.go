@@ -28,14 +28,12 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handler.HealthCheck)
-	if err := stroke.Register(mux, stroke.Options{Role: cfg.StrokeRole, InternalSecret: cfg.InternalSecret, DatasetRoot: cfg.StrokeDatasetRoot, StoreURL: cfg.StrokeStoreURL, StoreSecret: cfg.StrokeStoreSecret, StorageRoot: cfg.StrokeStorageRoot}); err != nil {
+	strokes, err := stroke.Register(mux, stroke.Options{Role: cfg.StrokeRole, InternalSecret: cfg.InternalSecret, DatasetRoot: cfg.StrokeDatasetRoot, StorageRoot: cfg.StrokeStorageRoot})
+	if err != nil {
 		log.Fatalf("[FATAL] Stroke configuration: %v", err)
 	}
 
-	// OV runs the receiver role only. It must never initialize media storage or
-	// register media upload/serve routes; durable media belongs on Worker 212.
-	if cfg.StrokeRole != "receiver" {
-
+	{
 		// Initialize disk storage
 		store, err := storage.NewDiskStorage(cfg.StorageRoot)
 		if err != nil {
@@ -49,7 +47,11 @@ func main() {
 		// Handlers
 		uploadHandler := handler.NewUploadHandler(cfg, store, incidentReporter)
 		uploadZipHandler := handler.NewUploadZipHandler(cfg, store, incidentReporter)
-		serveHandler := handler.NewServeHandler(cfg, store)
+		var serveHandler http.Handler = handler.NewServeHandler(cfg, store)
+		if strokes != nil {
+			// GET /store/stroke_*.svg: generated on worker212, copied by OV nginx on a miss.
+			serveHandler = strokes.WrapStore(serveHandler)
+		}
 		stagingHandler := handler.NewStagingHandler(cfg, store)
 		mux.Handle("POST /media/commit", stagingHandler)
 		mux.Handle("POST /media/staged/inspect", stagingHandler)
@@ -128,10 +130,6 @@ func gatewaySecurityMiddleware(cfg *config.Config, next http.Handler) http.Handl
 				return
 			}
 			next.ServeHTTP(w, r)
-			return
-		}
-		if cfg.StrokeRole == "receiver" {
-			http.NotFound(w, r)
 			return
 		}
 

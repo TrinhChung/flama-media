@@ -21,11 +21,11 @@ services:
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}
       - STROKE_ROLE=${STROKE_ROLE:-disabled}
       - STROKE_DATASET_ROOT=${STROKE_DATASET_ROOT:-}
-      - STROKE_STORE_URL=${STROKE_STORE_URL:-}
-      - STROKE_STORE_SECRET=${STROKE_STORE_SECRET:-}
+      - STROKE_STORAGE_ROOT=/data/flama/strokes
     volumes:
       # Host systemd-tmpfiles must clean data/media/staging after one day.
       - ${MEDIA_HOST_ROOT:-./data/media}:/data/flama/media
+      - ${STROKE_HOST_ROOT:-./data/strokes}:/data/flama/strokes
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:4792/health"]
       interval: 30s

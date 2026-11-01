@@ -45,14 +45,3 @@ func TestDirectUploadCORSPreflightRequiresAllowedOrigin(t *testing.T) {
 		}
 	}
 }
-
-func TestReceiverDoesNotExposeMediaRoutes(t *testing.T) {
-	cfg := &config.Config{StrokeRole: "receiver", InternalSecret: "internal"}
-	h := gatewaySecurityMiddleware(cfg, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
-	r := httptest.NewRequest(http.MethodPost, "/media/upload", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
-	if w.Code != 404 {
-		t.Fatal("receiver exposed media")
-	}
-}

@@ -1,18 +1,15 @@
 package stroke
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,14 +20,13 @@ import (
 	"unicode/utf8"
 )
 
-// Options deliberately separates media storage on212 from the stroke-only
-// receiver onOV. Neither process mounts the other machine's data directory.
+// Options configures the stroke worker on worker212. Generated SVGs are kept in
+// StorageRoot on worker212; the OV gateway runs nginx only and copies a file
+// from GET /store/stroke_*.svg the first time it misses (proxy_store).
 type Options struct {
 	Role           string
 	InternalSecret string
 	DatasetRoot    string
-	StoreURL       string
-	StoreSecret    string
 	StorageRoot    string
 }
 
@@ -48,51 +44,41 @@ type Item struct {
 
 type service struct {
 	opts     Options
-	client   *http.Client
 	upstream *http.Client
 	mu       sync.Mutex
 	slots    chan struct{}
 }
 
-// Register mounts authenticated internal APIs only. Public /store/stroke_*.svg
-// remains served by OV Nginx from StorageRoot.
-func Register(mux *http.ServeMux, opts Options) error {
+// Service is the registered stroke worker; nil when strokes are disabled.
+type Service struct{ s *service }
+
+// Register mounts POST /internal/strokes/generate (internal secret) and returns
+// the worker so the caller can route GET /store/stroke_*.svg to it.
+func Register(mux *http.ServeMux, opts Options) (*Service, error) {
 	role := strings.ToLower(strings.TrimSpace(opts.Role))
 	if role == "" || role == "disabled" {
-		return nil
+		return nil, nil
 	}
-	if role != "worker" && role != "receiver" {
-		return errors.New("STROKE_ROLE must be worker, receiver or disabled")
+	if role != "worker" {
+		return nil, errors.New("STROKE_ROLE must be worker or disabled (OV runs nginx only)")
 	}
 	if strings.TrimSpace(opts.InternalSecret) == "" {
-		return errors.New("stroke internal secret is required")
+		return nil, errors.New("stroke internal secret is required")
 	}
-	if role == "worker" {
-		u, err := url.Parse(opts.StoreURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || opts.StoreSecret == "" {
-			return errors.New("stroke worker requires STROKE_STORE_URL and STROKE_STORE_SECRET")
-		}
-	} else {
-		if opts.StorageRoot == "" {
-			return errors.New("stroke receiver requires STROKE_STORAGE_ROOT")
-		}
-		root, err := filepath.Abs(opts.StorageRoot)
-		if err != nil {
-			return err
-		}
-		opts.StorageRoot = root
-		if err := os.MkdirAll(root, 0750); err != nil {
-			return err
-		}
+	if opts.StorageRoot == "" {
+		return nil, errors.New("stroke worker requires STROKE_STORAGE_ROOT")
 	}
-	s := &service{opts: opts, client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, upstream: &http.Client{Timeout: 5 * time.Second, CheckRedirect: canonicalRedirect}, slots: make(chan struct{}, 8)}
-	if role == "worker" {
-		mux.HandleFunc("POST /internal/strokes/generate", s.authorized(s.generate))
-	} else {
-		mux.HandleFunc("PUT /internal/strokes/{filename}", s.authorized(s.receive))
-		mux.HandleFunc("HEAD /internal/strokes/{filename}", s.authorized(s.stat))
+	root, err := filepath.Abs(opts.StorageRoot)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	opts.StorageRoot = root
+	if err := os.MkdirAll(root, 0750); err != nil {
+		return nil, err
+	}
+	s := &service{opts: opts, upstream: &http.Client{Timeout: 5 * time.Second, CheckRedirect: canonicalRedirect}, slots: make(chan struct{}, 8)}
+	mux.HandleFunc("POST /internal/strokes/generate", s.authorized(s.generate))
+	return &Service{s: s}, nil
 }
 
 func canonicalRedirect(req *http.Request, via []*http.Request) error {
@@ -185,68 +171,31 @@ func (s *service) generate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
 }
 
-func (s *service) storeRequest(ctx context.Context, method, key string, data []byte) (*http.Response, error) {
-	endpoint := strings.TrimRight(s.opts.StoreURL, "/") + "/" + key + ".svg"
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("X-Internal-Secret", s.opts.StoreSecret)
-	req.Header.Set("Content-Type", "image/svg+xml")
-	return s.client.Do(req)
-}
-
 func (s *service) generateOne(ctx context.Context, ch, locale string) Item {
 	return s.generateOneForce(ctx, ch, locale, false)
 }
 
+func strokeKey(c rune, locale string) (key, hexCode string) {
+	hexCode = fmt.Sprintf("%x", c)
+	return "stroke_" + strings.ReplaceAll(locale, "-", "_") + "_" + hexCode, hexCode
+}
+
 func (s *service) generateOneForce(ctx context.Context, ch, locale string, force bool) Item {
 	c, _ := utf8.DecodeRuneInString(ch)
-	h := fmt.Sprintf("%x", c)
-	key := "stroke_" + strings.ReplaceAll(locale, "-", "_") + "_" + h
+	key, h := strokeKey(c, locale)
 	item := Item{Char: ch, Hex: h, ImageKey: key, URL: "/store/" + key + ".svg"}
 	if !force {
-		resp, err := s.storeRequest(ctx, http.MethodHead, key, nil)
-		if err != nil {
-			item.Error = "STROKE_STORE_UNAVAILABLE"
-			return item
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			sum := resp.Header.Get("X-Content-SHA256")
-			size, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
-			if len(sum) == 64 && size > 0 {
-				item.Available = true
-				item.Cached = true
-				item.SHA256 = sum
-				item.SizeBytes = size
-				return item
-			}
-			item.Error = "STROKE_STORE_INVALID_RESPONSE"
-			return item
-		}
-		if resp.StatusCode != http.StatusNotFound {
-			item.Error = "STROKE_STORE_UNAVAILABLE"
+		if sum, size, ok := s.statLocal(key); ok {
+			item.Available, item.Cached, item.SHA256, item.SizeBytes = true, true, sum, size
 			return item
 		}
 	}
-	raw, err := s.source(ctx, c, locale)
-	if err != nil {
-		item.Error = "STROKE_SOURCE_UNAVAILABLE"
+	data, errCode := s.build(ctx, c, locale)
+	if errCode != "" {
+		item.Error = errCode
 		return item
 	}
-	data, err := Normalize(raw, h)
-	if err != nil {
-		item.Error = "STROKE_SOURCE_INVALID"
-		return item
-	}
-	resp, err := s.storeRequest(ctx, http.MethodPut, key, data)
-	if err != nil {
-		item.Error = "STROKE_STORE_UNAVAILABLE"
-		return item
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+	if err := s.writeLocal(key, data); err != nil {
 		item.Error = "STROKE_STORE_UNAVAILABLE"
 		return item
 	}
@@ -255,6 +204,67 @@ func (s *service) generateOneForce(ctx context.Context, ch, locale string, force
 	item.SHA256 = hex.EncodeToString(sum[:])
 	item.SizeBytes = int64(len(data))
 	return item
+}
+
+func (s *service) build(ctx context.Context, c rune, locale string) ([]byte, string) {
+	raw, err := s.source(ctx, c, locale)
+	if err != nil {
+		return nil, "STROKE_SOURCE_UNAVAILABLE"
+	}
+	data, err := Normalize(raw, fmt.Sprintf("%x", c))
+	if err != nil {
+		return nil, "STROKE_SOURCE_INVALID"
+	}
+	return data, ""
+}
+
+func (s *service) localPath(key string) string {
+	return filepath.Join(s.opts.StorageRoot, key+".svg")
+}
+
+func (s *service) statLocal(key string) (string, int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.Open(s.localPath(key))
+	if err != nil {
+		return "", 0, false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxSVGBytes {
+		return "", 0, false
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(f, maxSVGBytes+1))
+	if err != nil {
+		return "", 0, false
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, true
+}
+
+// writeLocal stores an SVG atomically (temp file, fsync, rename).
+func (s *service) writeLocal(key string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.CreateTemp(s.opts.StorageRoot, ".stroke-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(0644); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmp, s.localPath(key))
+	}
+	return err
 }
 
 func (s *service) source(ctx context.Context, c rune, locale string) ([]byte, error) {
@@ -301,107 +311,65 @@ func (s *service) source(ctx context.Context, c rune, locale string) ([]byte, er
 
 var filenameRE = regexp.MustCompile(`^stroke_(ja|zh|zh_hant)_([a-f0-9]{4,6})\.svg$`)
 
-func (s *service) path(r *http.Request) (string, bool) {
-	name := r.PathValue("filename")
+func parseFilename(name string) (key, locale string, c rune, ok bool) {
 	m := filenameRE.FindStringSubmatch(name)
 	if len(m) != 3 {
-		return "", false
+		return "", "", 0, false
 	}
 	cp, err := strconv.ParseInt(m[2], 16, 32)
 	if err != nil || !validCJK(rune(cp)) || fmt.Sprintf("%x", cp) != m[2] {
-		return "", false
+		return "", "", 0, false
 	}
-	return filepath.Join(s.opts.StorageRoot, name), true
+	return strings.TrimSuffix(name, ".svg"), strings.ReplaceAll(m[1], "_", "-"), rune(cp), true
 }
 
-func (s *service) stat(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.path(r)
+// WrapStore serves GET/HEAD /store/stroke_<locale>_<hex>.svg from StorageRoot,
+// generating a missing file first, and passes every other path to next.
+func (svc *Service) WrapStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name, isStore := strings.CutPrefix(r.URL.Path, "/store/")
+		if !isStore || !strings.HasPrefix(name, "stroke_") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		svc.s.serve(w, r, name)
+	})
+}
+
+func (s *service) serve(w http.ResponseWriter, r *http.Request, name string) {
+	key, locale, c, ok := parseFilename(name)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	f, err := os.Open(p)
+	if _, _, exists := s.statLocal(key); !exists {
+		select {
+		case s.slots <- struct{}{}:
+		case <-r.Context().Done():
+			http.Error(w, "request cancelled", http.StatusRequestTimeout)
+			return
+		}
+		data, errCode := s.build(r.Context(), c, locale)
+		<-s.slots
+		if errCode != "" || s.writeLocal(key, data) != nil {
+			http.NotFound(w, r)
+			return
+		}
+	}
+	f, err := os.Open(s.localPath(key))
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxSVGBytes {
+	if err != nil || !info.Mode().IsRegular() {
 		http.NotFound(w, r)
 		return
 	}
-	h := sha256.New()
-	n, err := io.Copy(h, io.LimitReader(f, maxSVGBytes+1))
-	if err != nil {
-		http.Error(w, "stroke read failed", 500)
-		return
-	}
-	w.Header().Set("X-Content-SHA256", hex.EncodeToString(h.Sum(nil)))
-	w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
-	w.WriteHeader(http.StatusOK)
-}
-
-func (s *service) receive(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.path(r)
-	if !ok {
-		http.Error(w, "invalid stroke filename", 400)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxSVGBytes)
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "stroke exceeds limit", 413)
-		return
-	}
-	root, err := parseSVG(data)
-	if err != nil || root.get("class") == "" || !strings.Contains(root.get("class"), "flama-stroke-char") {
-		http.Error(w, "invalid generated stroke SVG", 400)
-		return
-	}
-	// Re-serialize the parsed allowlisted tree, never the original wire bytes.
-	// This also removes unknown attributes and namespace metadata at the receiver.
-	var clean bytes.Buffer
-	encoder := xml.NewEncoder(&clean)
-	if err := writeNode(encoder, root); err != nil {
-		http.Error(w, "invalid stroke SVG", 400)
-		return
-	}
-	if err := encoder.Flush(); err != nil {
-		http.Error(w, "invalid stroke SVG", 400)
-		return
-	}
-	data = clean.Bytes()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	f, err := os.CreateTemp(s.opts.StorageRoot, ".stroke-*")
-	if err != nil {
-		http.Error(w, "stroke storage unavailable", 500)
-		return
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if err = f.Chmod(0640); err == nil {
-		_, err = f.Write(data)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	closeErr := f.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(tmp, p)
-	}
-	if err != nil {
-		http.Error(w, "stroke storage failed", 500)
-		return
-	}
-	sum := sha256.Sum256(data)
-	w.Header().Set("X-Content-SHA256", hex.EncodeToString(sum[:]))
-	w.Header().Set("X-Content-Size", strconv.Itoa(len(data)))
-	w.WriteHeader(http.StatusCreated)
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	http.ServeContent(w, r, name, info.ModTime(), f)
 }

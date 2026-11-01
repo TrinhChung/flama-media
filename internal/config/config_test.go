@@ -11,9 +11,8 @@ func TestConfigurationFailsClosedWithoutSecrets(t *testing.T) {
 		t.Fatal("missing secrets accepted")
 	}
 	t.Setenv("INTERNAL_SECURITY_SECRET", "internal")
-	t.Setenv("STROKE_ROLE", "receiver")
-	if err := Load().Validate(); err != nil {
-		t.Fatalf("receiver should not require public upload credentials: %v", err)
+	if err := Load().Validate(); err == nil {
+		t.Fatal("upload and gateway secrets are required")
 	}
 }
 

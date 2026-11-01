@@ -92,32 +92,32 @@ func TestPreviouslyNormalizedMMAHKeepsChineseGridAndAttribution(t *testing.T) {
 	}
 }
 
-func TestWorkerGeneratesOn212StoresOnlyOnOVAndReusesStoredStroke(t *testing.T) {
-	root := t.TempDir()
-	receiverMux := http.NewServeMux()
-	if err := Register(receiverMux, Options{Role: "receiver", InternalSecret: "receiver-secret", StorageRoot: root}); err != nil {
-		t.Fatal(err)
-	}
-	receiver := httptest.NewServer(receiverMux)
-	defer receiver.Close()
-	dataset := t.TempDir()
+func newWorker(t *testing.T) (*http.ServeMux, *Service, string, string) {
+	t.Helper()
+	root, dataset := t.TempDir(), t.TempDir()
 	if err := os.Mkdir(filepath.Join(dataset, "ja"), 0750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dataset, "ja", "4e00.svg"), []byte(kvgFixture), 0640); err != nil {
 		t.Fatal(err)
 	}
-	workerMux := http.NewServeMux()
-	if err := Register(workerMux, Options{Role: "worker", InternalSecret: "backend-secret", DatasetRoot: dataset, StoreURL: receiver.URL + "/internal/strokes", StoreSecret: "receiver-secret"}); err != nil {
-		t.Fatal(err)
+	mux := http.NewServeMux()
+	svc, err := Register(mux, Options{Role: "worker", InternalSecret: "backend-secret", DatasetRoot: dataset, StorageRoot: root})
+	if err != nil || svc == nil {
+		t.Fatalf("register: %v", err)
 	}
+	return mux, svc, root, dataset
+}
+
+func TestWorkerGeneratesOn212AndReusesStoredStroke(t *testing.T) {
+	mux, _, root, dataset := newWorker(t)
 	call := func(force bool) Item {
 		t.Helper()
 		body, _ := json.Marshal(map[string]any{"characters": []string{"一"}, "locale": "ja", "force": force})
 		req := httptest.NewRequest(http.MethodPost, "/internal/strokes/generate", bytes.NewReader(body))
 		req.Header.Set("X-Internal-Secret", "backend-secret")
 		w := httptest.NewRecorder()
-		workerMux.ServeHTTP(w, req)
+		mux.ServeHTTP(w, req)
 		if w.Code != 200 {
 			t.Fatalf("status %d %s", w.Code, w.Body.String())
 		}
@@ -139,7 +139,7 @@ func TestWorkerGeneratesOn212StoresOnlyOnOVAndReusesStoredStroke(t *testing.T) {
 	}
 	sum := sha256.Sum256(stored)
 	if first.SHA256 != hex.EncodeToString(sum[:]) || first.SizeBytes != int64(len(stored)) {
-		t.Fatal("receipt does not match OV disk")
+		t.Fatal("receipt does not match the stored file")
 	}
 	second := call(false)
 	if !second.Available || !second.Cached || first.SHA256 != second.SHA256 {
@@ -156,38 +156,49 @@ func TestWorkerGeneratesOn212StoresOnlyOnOVAndReusesStoredStroke(t *testing.T) {
 	if err != nil || len(files) != 1 {
 		t.Fatalf("unexpected temporary files: %v", files)
 	}
+	req := httptest.NewRequest(http.MethodPost, "/internal/strokes/generate", strings.NewReader(`{"characters":["一"],"locale":"ja"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("generate without secret: %d", w.Code)
+	}
 }
 
-func TestReceiverRequiresSecretRejectsTraversalAndStripsUnknownAttrs(t *testing.T) {
-	root := t.TempDir()
-	mux := http.NewServeMux()
-	if err := Register(mux, Options{Role: "receiver", InternalSecret: "secret", StorageRoot: root}); err != nil {
-		t.Fatal(err)
-	}
-	for _, test := range []struct {
-		path, body, secret string
-		status             int
-	}{
-		{"/internal/strokes/stroke_ja_4e00.svg", kvgFixture, "", 401},
-		{"/internal/strokes/stroke_ja_004e00.svg", kvgFixture, "secret", 400},
-		{"/internal/strokes/stroke_ja_1234.svg", kvgFixture, "secret", 400},
-		{"/internal/strokes/stroke_ja_4e00.svg", `<svg class="flama-stroke-char"><script/></svg>`, "secret", 400},
-		{"/internal/strokes/stroke_ja_4e00.svg", `<svg xmlns="http://www.w3.org/2000/svg" class="flama-stroke-char" onload="alert(1)"><path d="M0 0 L1 1" href="https://example.com"/></svg>`, "secret", 201},
-	} {
-		r := httptest.NewRequest(http.MethodPut, test.path, strings.NewReader(test.body))
-		r.Header.Set("X-Internal-Secret", test.secret)
+func TestStoreServesAndGeneratesMissingStrokesOnly(t *testing.T) {
+	_, svc, root, _ := newWorker(t)
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	h := svc.WrapStore(next)
+	get := func(path string) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, r)
-		if w.Code != test.status {
-			t.Fatalf("%s wanted %d got %d %s", test.path, test.status, w.Code, w.Body.String())
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		return w
+	}
+	w := get("/store/stroke_ja_4e00.svg")
+	if w.Code != 200 || w.Header().Get("Content-Type") != "image/svg+xml" || !strings.Contains(w.Body.String(), "flama-stroke-char") {
+		t.Fatalf("missing stroke not generated: %d %q", w.Code, w.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(w.Header().Get("Content-Security-Policy"), "sandbox") {
+		t.Fatal("stroke served without sandbox CSP")
+	}
+	if _, err := os.Stat(filepath.Join(root, "stroke_ja_4e00.svg")); err != nil {
+		t.Fatal("generated stroke not stored")
+	}
+	for _, path := range []string{"/store/stroke_ja_004e00.svg", "/store/stroke_ja_1234.svg", "/store/stroke_xx_4e00.svg", "/store/stroke_ja_4e00.svg.bak"} {
+		if w := get(path); w.Code != http.StatusNotFound {
+			t.Fatalf("%s: %d", path, w.Code)
 		}
 	}
-	data, err := os.ReadFile(filepath.Join(root, "stroke_ja_4e00.svg"))
-	if err != nil {
-		t.Fatal(err)
+	if w := get("/store/0b8ef6f9-6c3a-4c55-8a39-4a8c1d6a0f11"); w.Code != http.StatusTeapot {
+		t.Fatal("media ids must reach the media store handler")
 	}
-	if bytes.Contains(data, []byte("onload")) || bytes.Contains(data, []byte("href")) {
-		t.Fatal("receiver wrote unfiltered bytes")
+}
+
+func TestReceiverRoleIsGone(t *testing.T) {
+	if _, err := Register(http.NewServeMux(), Options{Role: "receiver", InternalSecret: "secret", StorageRoot: t.TempDir()}); err == nil {
+		t.Fatal("receiver role accepted; OV runs nginx only")
+	}
+	if svc, err := Register(http.NewServeMux(), Options{Role: "disabled"}); svc != nil || err != nil {
+		t.Fatalf("disabled role: %v %v", svc, err)
 	}
 }
 
@@ -199,11 +210,7 @@ func (failTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func TestMissingCanonicalStrokeIsUnavailable(t *testing.T) {
 	root := t.TempDir()
-	mux := http.NewServeMux()
-	_ = Register(mux, Options{Role: "receiver", InternalSecret: "secret", StorageRoot: root})
-	server := httptest.NewServer(mux)
-	defer server.Close()
-	s := &service{opts: Options{StoreURL: server.URL + "/internal/strokes", StoreSecret: "secret"}, client: server.Client(), upstream: &http.Client{Transport: failTransport{}}}
+	s := &service{opts: Options{StorageRoot: root}, upstream: &http.Client{Transport: failTransport{}}, slots: make(chan struct{}, 1)}
 	item := s.generateOne(context.Background(), "一", "ja")
 	if item.Available || item.Error != "STROKE_SOURCE_UNAVAILABLE" {
 		t.Fatalf("bad missing result %+v", item)

@@ -25,8 +25,6 @@ type Config struct {
 	ListenHost          string
 	StrokeRole          string
 	StrokeDatasetRoot   string
-	StrokeStoreURL      string
-	StrokeStoreSecret   string
 	StrokeStorageRoot   string
 }
 
@@ -66,8 +64,6 @@ func Load() *Config {
 		ListenHost:          getEnv("LISTEN_HOST", "127.0.0.1"),
 		StrokeRole:          strings.ToLower(strings.TrimSpace(getEnv("STROKE_ROLE", "disabled"))),
 		StrokeDatasetRoot:   getEnv("STROKE_DATASET_ROOT", ""),
-		StrokeStoreURL:      getEnv("STROKE_STORE_URL", ""),
-		StrokeStoreSecret:   getEnv("STROKE_STORE_SECRET", ""),
 		StrokeStorageRoot:   getEnv("STROKE_STORAGE_ROOT", ""),
 	}
 }
@@ -76,7 +72,7 @@ func (c *Config) Validate() error {
 	if c.InternalSecret == "" {
 		return fmt.Errorf("INTERNAL_SECURITY_SECRET is required")
 	}
-	if c.StrokeRole != "receiver" && (c.SharedSecret == "" || c.GatewaySecret == "") {
+	if c.SharedSecret == "" || c.GatewaySecret == "" {
 		return fmt.Errorf("MEDIA_SHARED_SECRET and GATEWAY_SECRET are required")
 	}
 	if c.MaxUploadBytes <= 0 || c.MaxUploadBytes > 1<<30 || c.MaxImageDimension <= 0 || c.MaxImagePixels <= 0 || c.ResizeDimension <= 0 || c.StageTTLSeconds <= 0 {

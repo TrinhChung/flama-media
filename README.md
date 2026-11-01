@@ -1,8 +1,8 @@
 # Flama Media (Go)
 
-Go trên **Worker 212** nhận và xử lý ảnh/audio/ZIP. Media được lưu lâu dài trên
-212. Go cũng sinh SVG stroke và gửi qua VPN tới receiver trên **OV**; OV chỉ lưu
-SVG stroke, không nhận media upload thông thường.
+Go trên **Worker 212** nhận và xử lý ảnh/audio/ZIP, tải URL công khai cho backend
+và sinh SVG stroke. Media được lưu lâu dài trên 212. **OV** chỉ chạy nginx: phục vụ
+`media.flama.vn`, lưu SVG stroke và tự chép từ 212 file stroke nó chưa có.
 
 ## Upload và lưu thẻ
 
@@ -80,14 +80,18 @@ gateway secret vào frontend. CORS chỉ cho phép origin khai báo rõ trong
 
 ## SVG stroke
 
-`STROKE_ROLE=worker` trên 212 mở `POST /internal/strokes/generate`; worker đọc
-dataset canonical, sinh SVG và `PUT` tới `STROKE_STORE_URL` trên OV.
-`STROKE_ROLE=receiver` trên OV chỉ mở health và các route stroke nội bộ; không
-khởi tạo kho media hoặc các route upload/store. Public SVG được Nginx OV phục vụ.
+`STROKE_ROLE=worker` trên 212 (cần `STROKE_STORAGE_ROOT`) mở:
 
-`STROKE_STORE_URL` phải gồm `/internal/strokes`, ví dụ
-`http://wg-gateway:4793/internal/strokes`. Secret worker gửi sang OV phải khớp
-`INTERNAL_SECURITY_SECRET` của receiver. Xem [stroke attribution](internal/stroke/THIRD_PARTY.md) cho
+- `POST /internal/strokes/generate` (`X-Internal-Secret`): backend gửi tối đa 100 ký tự
+  CJK; worker đọc dataset canonical (KanjiVG / Make Me a Hanzi, hoặc
+  `STROKE_DATASET_ROOT`), chuẩn hoá SVG và lưu `stroke_<locale>_<hex>.svg` vào
+  `STROKE_STORAGE_ROOT`.
+- `GET /store/stroke_<locale>_<hex>.svg` (gateway secret): trả file đã lưu, thiếu thì
+  sinh rồi trả.
+
+OV không chạy Go. Nginx OV phục vụ file có sẵn trong thư mục stroke; khi thiếu, nó
+lấy từ `GET /store/stroke_….svg` của 212 và ghi lại bằng `proxy_store`, nên OV dần
+giữ đủ mọi SVG stroke. Xem [stroke attribution](internal/stroke/THIRD_PARTY.md) cho
 nguồn/license của dữ liệu stroke.
 
 ## Chạy và kiểm tra
