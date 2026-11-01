@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -208,15 +209,37 @@ func (failTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
 }
 
-func TestMissingCanonicalStrokeIsUnavailable(t *testing.T) {
+type errTransport struct{}
+
+func (errTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("network down")
+}
+
+func TestCharacterMissingEverywhereGetsPlaceholder(t *testing.T) {
 	root := t.TempDir()
 	s := &service{opts: Options{StorageRoot: root}, upstream: &http.Client{Transport: failTransport{}}, slots: make(chan struct{}, 1)}
+	item := s.generateOne(context.Background(), "齉", "ja")
+	if !item.Available || !item.Placeholder || item.Error != "" {
+		t.Fatalf("bad placeholder result %+v", item)
+	}
+	data, err := os.ReadFile(filepath.Join(root, item.ImageKey+".svg"))
+	if err != nil || !bytes.Contains(data, []byte(">齉</text>")) || !bytes.Contains(data, []byte(`class="flama-stroke-char"`)) {
+		t.Fatalf("placeholder not stored: %v %s", err, data)
+	}
+	if _, err := parseSVG(data); err != nil {
+		t.Fatalf("placeholder is not valid SVG: %v", err)
+	}
+}
+
+func TestUnreachableSourceIsUnavailableNotPlaceholder(t *testing.T) {
+	root := t.TempDir()
+	s := &service{opts: Options{StorageRoot: root}, upstream: &http.Client{Transport: errTransport{}}, slots: make(chan struct{}, 1)}
 	item := s.generateOne(context.Background(), "一", "ja")
-	if item.Available || item.Error != "STROKE_SOURCE_UNAVAILABLE" {
-		t.Fatalf("bad missing result %+v", item)
+	if item.Available || item.Placeholder || item.Error != "STROKE_SOURCE_UNAVAILABLE" {
+		t.Fatalf("bad unavailable result %+v", item)
 	}
 	files, _ := os.ReadDir(root)
 	if len(files) != 0 {
-		t.Fatal("missing stroke created a file")
+		t.Fatal("network failure stored a file")
 	}
 }

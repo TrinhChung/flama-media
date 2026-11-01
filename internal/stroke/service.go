@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"os"
@@ -40,6 +41,9 @@ type Item struct {
 	SizeBytes int64  `json:"size_bytes,omitempty"`
 	Error     string `json:"error,omitempty"`
 	Cached    bool   `json:"cached,omitempty"`
+	// Placeholder marks a generated box with the character as text, used when
+	// no canonical stroke data exists for it.
+	Placeholder bool `json:"placeholder,omitempty"`
 }
 
 type service struct {
@@ -190,11 +194,12 @@ func (s *service) generateOneForce(ctx context.Context, ch, locale string, force
 			return item
 		}
 	}
-	data, errCode := s.build(ctx, c, locale)
+	data, placeholder, errCode := s.build(ctx, c, locale)
 	if errCode != "" {
 		item.Error = errCode
 		return item
 	}
+	item.Placeholder = placeholder
 	if err := s.writeLocal(key, data); err != nil {
 		item.Error = "STROKE_STORE_UNAVAILABLE"
 		return item
@@ -206,16 +211,22 @@ func (s *service) generateOneForce(ctx context.Context, ch, locale string, force
 	return item
 }
 
-func (s *service) build(ctx context.Context, c rune, locale string) ([]byte, string) {
+// build returns the normalized canonical SVG, or the placeholder when every
+// source answered that the character does not exist. Network errors are not
+// turned into placeholders, so a later request can still get the real data.
+func (s *service) build(ctx context.Context, c rune, locale string) ([]byte, bool, string) {
 	raw, err := s.source(ctx, c, locale)
+	if errors.Is(err, errSourceNotFound) {
+		return Placeholder(c, locale), true, ""
+	}
 	if err != nil {
-		return nil, "STROKE_SOURCE_UNAVAILABLE"
+		return nil, false, "STROKE_SOURCE_UNAVAILABLE"
 	}
 	data, err := Normalize(raw, fmt.Sprintf("%x", c))
 	if err != nil {
-		return nil, "STROKE_SOURCE_INVALID"
+		return nil, false, "STROKE_SOURCE_INVALID"
 	}
-	return data, ""
+	return data, false, ""
 }
 
 func (s *service) localPath(key string) string {
@@ -290,6 +301,7 @@ func (s *service) source(ctx context.Context, c rune, locale string) ([]byte, er
 	if locale != "ja" {
 		urls = []string{mmah, kvg}
 	}
+	notFound := 0
 	for _, u := range urls {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
@@ -305,8 +317,35 @@ func (s *service) source(ctx context.Context, c rune, locale string) ([]byte, er
 		if resp.StatusCode == http.StatusOK && readErr == nil && len(data) <= maxSVGBytes {
 			return data, nil
 		}
+		if resp.StatusCode == http.StatusNotFound {
+			notFound++
+		}
+	}
+	if notFound == len(urls) {
+		return nil, errSourceNotFound
 	}
 	return nil, errors.New("canonical stroke data unavailable")
+}
+
+var errSourceNotFound = errors.New("no canonical stroke data for this character")
+
+// Placeholder mirrors app/services/strokes/dataset_builder.generate_kanji_placeholder_svg:
+// a dashed practice box with the character drawn as text.
+func Placeholder(c rune, locale string) []byte {
+	fonts := "'Noto Sans CJK JP', 'Hiragino Sans', 'Yu Gothic', 'Meiryo', sans-serif"
+	switch locale {
+	case "zh-hant":
+		fonts = "'PingFang TC', 'Microsoft JhengHei', 'Noto Sans TC', sans-serif"
+	case "zh":
+		fonts = "'PingFang SC', 'Microsoft YaHei', 'SimHei', 'Noto Sans SC', sans-serif"
+	}
+	ch := html.EscapeString(string(c))
+	return []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 109 109" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" class="flama-stroke-char" data-char="` + ch + `" data-hex="` + fmt.Sprintf("%x", c) + `">` +
+		`<rect width="107" height="107" x="1" y="1" fill="none" stroke="#e2e8f0" stroke-width="1.5" stroke-dasharray="3 3" rx="8" />` +
+		`<line x1="54.5" y1="1" x2="54.5" y2="108" stroke="#f1f5f9" stroke-width="1" stroke-dasharray="2 2" />` +
+		`<line x1="1" y1="54.5" x2="108" y2="54.5" stroke="#f1f5f9" stroke-width="1" stroke-dasharray="2 2" />` +
+		`<text x="54.5" y="78" font-family="` + fonts + `" font-size="64" text-anchor="middle" fill="#1e293b" font-weight="500">` + ch + `</text>` +
+		`</svg>`)
 }
 
 var filenameRE = regexp.MustCompile(`^stroke_(ja|zh|zh_hant)_([a-f0-9]{4,6})\.svg$`)
@@ -349,7 +388,7 @@ func (s *service) serve(w http.ResponseWriter, r *http.Request, name string) {
 			http.Error(w, "request cancelled", http.StatusRequestTimeout)
 			return
 		}
-		data, errCode := s.build(r.Context(), c, locale)
+		data, _, errCode := s.build(r.Context(), c, locale)
 		<-s.slots
 		if errCode != "" || s.writeLocal(key, data) != nil {
 			http.NotFound(w, r)
