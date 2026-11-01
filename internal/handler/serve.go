@@ -67,7 +67,12 @@ func (h *ServeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s%s"`, assetID, ext))
+
+	downloadFilename := assetID
+	if !strings.HasSuffix(strings.ToLower(assetID), ext) {
+		downloadFilename = assetID + ext
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, downloadFilename))
 
 	// Weak ETag using modtime and size
 	etag := fmt.Sprintf(`"%x-%x"`, fileInfo.ModTime().UnixNano(), fileInfo.Size())
@@ -98,12 +103,22 @@ func getMimeByExt(ext string) string {
 		return "image/gif"
 	case ".webp":
 		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
 	case ".mp3":
 		return "audio/mpeg"
 	case ".ogg":
 		return "audio/ogg"
 	case ".wav":
 		return "audio/wav"
+	case ".m4a":
+		return "audio/mp4"
+	case ".aac":
+		return "audio/aac"
+	case ".flac":
+		return "audio/flac"
+	case ".opus":
+		return "audio/opus"
 	default:
 		return "application/octet-stream"
 	}

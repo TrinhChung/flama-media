@@ -43,12 +43,27 @@ func TestDiskStorage_Deduplication(t *testing.T) {
 		t.Errorf("expected same SHA256 %s, got %s", asset1.SHA256, asset2.SHA256)
 	}
 
-	// 3. FindById
+	// 3. FindById with bare ID
 	path, err := store.FindById(asset1.ID)
 	if err != nil {
 		t.Fatalf("find by id error: %v", err)
 	}
 	if path == "" {
 		t.Errorf("expected path to not be empty")
+	}
+
+	// 4. FindById with extension (.mp3)
+	pathWithExt, err := store.FindById(asset1.ID + ".mp3")
+	if err != nil {
+		t.Fatalf("find by id with .mp3 error: %v", err)
+	}
+	if pathWithExt != path {
+		t.Errorf("expected path %s, got %s", path, pathWithExt)
+	}
+
+	// 5. FindById with wrong extension (.png) must return ErrNotExist
+	_, err = store.FindById(asset1.ID + ".png")
+	if err == nil {
+		t.Errorf("expected error when searching with mismatched extension .png, got nil")
 	}
 }

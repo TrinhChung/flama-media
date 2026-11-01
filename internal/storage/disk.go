@@ -112,7 +112,7 @@ func (s *DiskStorage) Save(data []byte, ext string, contentType string) (*SavedA
 	}, nil
 }
 
-// FindById locates an asset on disk by ID (either SHA-256 or legacy UUID).
+// FindById locates an asset on disk by ID (either SHA-256 or legacy UUID, with or without extension).
 func (s *DiskStorage) FindById(id string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -122,8 +122,15 @@ func (s *DiskStorage) FindById(id string) (string, error) {
 		return "", fmt.Errorf("invalid asset id")
 	}
 
-	prefix1 := id[0:2]
-	prefix2 := id[2:4]
+	reqExt := strings.ToLower(filepath.Ext(id))
+	baseID := strings.TrimSuffix(id, reqExt)
+
+	if len(baseID) < 4 {
+		return "", fmt.Errorf("invalid asset id")
+	}
+
+	prefix1 := baseID[0:2]
+	prefix2 := baseID[2:4]
 	shardDir := filepath.Join(s.rootDir, prefix1, prefix2)
 
 	entries, err := os.ReadDir(shardDir)
@@ -132,14 +139,23 @@ func (s *DiskStorage) FindById(id string) (string, error) {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), id) {
-			fullPath := filepath.Join(shardDir, entry.Name())
-			// Extra check: ensure fullPath is inside rootDir
-			rel, err := filepath.Rel(s.rootDir, fullPath)
-			if err != nil || strings.HasPrefix(rel, "..") {
-				return "", fmt.Errorf("path traversal violation")
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		entryExt := strings.ToLower(filepath.Ext(name))
+		entryBase := strings.TrimSuffix(name, entryExt)
+
+		if strings.EqualFold(entryBase, baseID) {
+			if reqExt == "" || strings.EqualFold(entryExt, reqExt) {
+				fullPath := filepath.Join(shardDir, name)
+				// Extra check: ensure fullPath is inside rootDir
+				rel, err := filepath.Rel(s.rootDir, fullPath)
+				if err != nil || strings.HasPrefix(rel, "..") {
+					return "", fmt.Errorf("path traversal violation")
+				}
+				return fullPath, nil
 			}
-			return fullPath, nil
 		}
 	}
 
