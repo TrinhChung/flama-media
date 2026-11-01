@@ -57,6 +57,9 @@ func main() {
 		mux.Handle("GET /media/staged/", stagingHandler)
 		mux.Handle("HEAD /media/staged/", stagingHandler)
 
+		// Public URL download for the backend (crawl); private network only
+		mux.Handle("POST /media/fetch-url", handler.NewFetchHandler(cfg))
+
 		// Single media upload routes
 		mux.Handle("POST /media/upload", uploadHandler)
 		mux.Handle("POST /upload", uploadHandler)
